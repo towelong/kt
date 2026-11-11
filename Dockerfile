@@ -31,6 +31,8 @@ RUN groupadd --system --gid 10001 app \
     && useradd --system --uid 10001 --gid app --home-dir /app app
 
 COPY --from=builder --chown=app:app /app /app
+# WORKDIR 以 root 创建了 /app，COPY --chown 不会改目录本身；sqlite 默认写这里
+RUN chown app:app /app
 
 USER app
 

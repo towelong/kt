@@ -14,7 +14,9 @@ from app.config import database_backend, get_settings, mask_url
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # 默认 disable_existing_loggers=True 会把 uvicorn/app 的 logger 全关掉，
+    # 启动失败时连堆栈都打不出来，所以应用内调用迁移时必须保留现有 logger。
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # autogenerate 的比较基准
 target_metadata = SQLModel.metadata

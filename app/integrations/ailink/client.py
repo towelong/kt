@@ -76,8 +76,10 @@ class AiLinkClient:
         limiter: RateLimiter | None = None,
         sleep=None,
     ) -> None:
-        if not base_url or not api_key or not api_secret:
-            raise AiLinkConfigError("AiLinkClient 需要 base_url、api_key、api_secret")
+        if not base_url or not base_url.startswith(("http://", "https://")):
+            raise AiLinkConfigError("AILINK_BASE_URL 必须是 http(s) 地址")
+        if not api_key or not api_secret:
+            raise AiLinkConfigError("AiLinkClient 需要非空的 api_key 和 api_secret")
         self.base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._api_secret = api_secret
@@ -99,7 +101,7 @@ class AiLinkClient:
         limiter: RateLimiter | None = None,
     ) -> Self:
         settings = settings or get_settings()
-        if settings.ailink_api_key is None or settings.ailink_api_secret is None:
+        if not settings.ailink_configured:
             raise AiLinkConfigError("未配置 AILINK_API_KEY / AILINK_API_SECRET，无法调用 VCC")
         limiter = limiter or RateLimiter("ailink", settings.ailink_rate_limit_per_minute)
         return cls(

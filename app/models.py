@@ -245,7 +245,7 @@ class Task(TimestampMixin, table=True):
     )
     payload_ciphertext: str | None = Field(
         default=None,
-        sa_column=Column(Text, nullable=True, comment="加密后的任务 payload（含 session）"),
+        sa_column=Column(Text, nullable=True),
         description="AES-256-GCM 密文，base64url；订单提交后清空",
     )
     status: str = Field(

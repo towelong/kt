@@ -44,14 +44,19 @@ async def lifespan(_app: FastAPI):
     callback_http: httpx.AsyncClient | None = None
     ailink_client: AiLinkClient | None = None
 
-    # 两个任务共用一个 AiLink 客户端和同一个限流窗口，避免各自一套配额叠加
+    # 两个任务共用一个 AiLink 客户端和同一个限流窗口，避免各自一套配额叠加。
+    # 配置错误只停掉依赖它的任务，API 本身要能起来，否则会变成重启循环。
     if settings.ailink_configured and (
         settings.card_stock_enabled or settings.subscription_worker_enabled
     ):
-        ailink_client = AiLinkClient.from_settings(
-            settings,
-            limiter=RateLimiter("ailink", settings.ailink_rate_limit_per_minute),
-        )
+        try:
+            ailink_client = AiLinkClient.from_settings(
+                settings,
+                limiter=RateLimiter("ailink", settings.ailink_rate_limit_per_minute),
+            )
+        except Exception:
+            logger.exception("初始化 AiLink 客户端失败，卡库存和补卡任务不会启动")
+            ailink_client = None
 
     if settings.card_stock_enabled:
         if ailink_client is None:
@@ -77,27 +82,39 @@ async def lifespan(_app: FastAPI):
                 "SUBSCRIPTION_WORKER_ENABLED=true 但未配置 TASK_PAYLOAD_KEY，worker 不启动"
             )
         else:
-            byoc_client = ByocClient.from_settings(
-                settings,
-                limiter=RateLimiter("byoc", settings.byoc_rate_limit_per_minute),
-            )
-            callback_http = httpx.AsyncClient(timeout=10.0)
-            if ailink_client is None:
-                logger.warning("未配置 AiLink，订阅任务触发的补卡会一直等待")
-            worker_task = asyncio.create_task(
-                run_task_worker(
-                    session_factory=session_scope,
-                    settings=settings,
-                    byoc=byoc_client,
-                    ailink=ailink_client,
-                    callback_http=callback_http,
-                    interval_seconds=settings.subscription_worker_interval_seconds,
+            try:
+                byoc_client = ByocClient.from_settings(
+                    settings,
+                    limiter=RateLimiter("byoc", settings.byoc_rate_limit_per_minute),
                 )
-            )
-            logger.info(
-                "订阅任务 worker 已启动，间隔 %ss",
-                settings.subscription_worker_interval_seconds,
-            )
+                callback_http = httpx.AsyncClient(timeout=10.0)
+            except Exception:
+                logger.exception("初始化 BYOC 客户端失败，订阅 worker 不会启动")
+                byoc_client = None
+                callback_http = None
+            if byoc_client is not None:
+                if ailink_client is None:
+                    logger.warning("未配置 AiLink，订阅任务触发的补卡会一直等待")
+                worker_task = asyncio.create_task(
+                    run_task_worker(
+                        session_factory=session_scope,
+                        settings=settings,
+                        byoc=byoc_client,
+                        ailink=ailink_client,
+                        callback_http=callback_http,
+                        interval_seconds=settings.subscription_worker_interval_seconds,
+                    )
+                )
+                logger.info(
+                    "订阅任务 worker 已启动，间隔 %ss",
+                    settings.subscription_worker_interval_seconds,
+                )
+
+    logger.info(
+        "应用启动完成：卡库存=%s 订阅 worker=%s",
+        stock_task is not None,
+        worker_task is not None,
+    )
 
     try:
         yield

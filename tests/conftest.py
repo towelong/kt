@@ -1,7 +1,6 @@
 """共享测试工具：Webhook 签名、样例事件、临时数据库。"""
 
 import json
-import logging
 import os
 import tempfile
 import time
@@ -14,7 +13,10 @@ import pytest
 
 # 在任何 app 模块导入前锁死测试库，避免测试碰到项目里的 app.db
 _TEST_DB = Path(tempfile.gettempdir()) / f"kt_pytest_{uuid4().hex}.db"
-os.environ.setdefault("DATABASE_URL", f"sqlite:///{_TEST_DB}")
+# 无条件覆盖：即使开发者 shell/.env 指向了 MySQL，测试也绝不碰真实库
+os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_DB}"
+# 测试里需要启动时自动建表，覆盖生产默认的 false
+os.environ.setdefault("AUTO_MIGRATE", "true")
 
 
 def pytest_report_header(config) -> str:
@@ -147,9 +149,6 @@ def db_engine(tmp_path):
 
     url = f"sqlite:///{tmp_path / 'cards.db'}"
     command.upgrade(alembic_config(url), "head")
-    # alembic 的 fileConfig 会 disable 已存在的 logger，测试里要重新打开才能断言日志
-    for logger_name in logging.root.manager.loggerDict:
-        logging.getLogger(logger_name).disabled = False
     engine = create_engine(url, connect_args={"check_same_thread": False})
     yield engine
     engine.dispose()

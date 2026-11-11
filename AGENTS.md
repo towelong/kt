@@ -84,7 +84,7 @@ uv run alembic check                                       # 只比对不写入�
 - `autogenerate` 需要连得上 `DATABASE_URL`，且库已到 head。
 - 删列/改类型优先分两次发布：先让代码停止读写，再发删列迁移。
 - 种子/数据迁移手写 `op.execute`，不要塞进启动逻辑。
-- 启动时默认自动 `upgrade head`（`AUTO_MIGRATE=true`）；多进程/多副本部署必须置 `false`，在发布流程里单独执行迁移。
+- 启动时默认不迁移（`AUTO_MIGRATE=false`）；开发可以置 `true`，多进程/多副本必须在发布流程里单独执行迁移。
 
 ## 测试与质量门
 

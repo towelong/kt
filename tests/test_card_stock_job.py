@@ -286,3 +286,101 @@ async def test_lifespan_subscription_worker_without_byoc_key_logs_error(monkeypa
 
     assert created == []
     assert "未配置 BYOC_API_KEY" in caplog.text
+
+
+def test_empty_secret_is_not_treated_as_configured():
+    settings = Settings(
+        _env_file=None,
+        ailink_api_key="",
+        ailink_api_secret="  ",
+        byoc_api_key="",
+        task_payload_key=" ",
+    )
+
+    assert settings.ailink_configured is False
+    assert settings.byoc_configured is False
+    assert settings.task_payload_configured is False
+
+
+async def test_lifespan_blank_byoc_key_keeps_api_up(monkeypatch, caplog):
+    caplog.set_level(logging.ERROR, logger="app.main")
+    monkeypatch.setattr(
+        main,
+        "settings",
+        Settings(
+            _env_file=None,
+            auto_migrate=False,
+            subscription_worker_enabled=True,
+            byoc_api_key="",
+            task_payload_key="payload_key",
+        ),
+    )
+    started: list[int] = []
+
+    async def fake_worker(**kwargs):
+        started.append(1)
+
+    monkeypatch.setattr(main, "run_task_worker", fake_worker)
+
+    async with main.lifespan(None):
+        pass
+
+    assert started == []
+    assert "未配置 BYOC_API_KEY" in caplog.text
+
+
+async def test_lifespan_invalid_byoc_url_keeps_api_up(monkeypatch, caplog):
+    caplog.set_level(logging.ERROR, logger="app.main")
+    monkeypatch.setattr(
+        main,
+        "settings",
+        Settings(
+            _env_file=None,
+            auto_migrate=False,
+            subscription_worker_enabled=True,
+            byoc_api_key="key",
+            byoc_base_url="http://wangbohui.com",
+            task_payload_key="payload_key",
+        ),
+    )
+    started: list[int] = []
+
+    async def fake_worker(**kwargs):
+        started.append(1)
+
+    monkeypatch.setattr(main, "run_task_worker", fake_worker)
+
+    async with main.lifespan(None):
+        pass
+
+    assert started == []
+    assert "初始化 BYOC 客户端失败" in caplog.text
+    assert "base_url 必须是本站 HTTPS 地址" in caplog.text
+
+
+async def test_lifespan_zero_rate_limit_keeps_api_up(monkeypatch, caplog):
+    caplog.set_level(logging.ERROR, logger="app.main")
+    monkeypatch.setattr(
+        main,
+        "settings",
+        Settings(
+            _env_file=None,
+            auto_migrate=False,
+            subscription_worker_enabled=True,
+            byoc_api_key="key",
+            task_payload_key="payload_key",
+            byoc_rate_limit_per_minute=0,
+        ),
+    )
+    started: list[int] = []
+
+    async def fake_worker(**kwargs):
+        started.append(1)
+
+    monkeypatch.setattr(main, "run_task_worker", fake_worker)
+
+    async with main.lifespan(None):
+        pass
+
+    assert started == []
+    assert "初始化 BYOC 客户端失败" in caplog.text

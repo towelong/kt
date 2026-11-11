@@ -106,7 +106,7 @@ class ByocClient:
         from app.config import get_settings
 
         settings = settings or get_settings()
-        if not settings.byoc_api_key:
+        if not settings.byoc_configured:
             raise ValueError("未配置 BYOC_API_KEY")
         limiter = limiter or RateLimiter("byoc", settings.byoc_rate_limit_per_minute)
         return cls(

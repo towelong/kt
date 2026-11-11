@@ -28,8 +28,9 @@ class Settings(BaseSettings):
 
     api_prefix: str = "/api"
     cors_origins: list[str] = []
-    # 启动时自动执行 alembic upgrade head；多进程部署建议关掉，改在发布流程里跑
-    auto_migrate: bool = True
+    # 启动时自动执行 alembic upgrade head。默认关闭，开发环境在 .env 里打开；
+    # 生产/多副本一律在发布流程里单独跑迁移
+    auto_migrate: bool = False
 
     # AiLink VCC 开放 API。Key/Secret 用 SecretStr，避免 repr、日志、异常里意外带出明文
     ailink_base_url: str = "https://card.ailinkvcc.com"
@@ -64,20 +65,26 @@ class Settings(BaseSettings):
 
     @property
     def ailink_configured(self) -> bool:
-        """Key/Secret 都配了才能调开放 API。"""
-        return self.ailink_api_key is not None and self.ailink_api_secret is not None
+        """Key/Secret 都非空才能调开放 API；空串不等于已配置。"""
+        return _secret_configured(self.ailink_api_key) and _secret_configured(
+            self.ailink_api_secret
+        )
 
     @property
     def ailink_webhook_configured(self) -> bool:
-        return self.ailink_webhook_secret is not None
+        return _secret_configured(self.ailink_webhook_secret)
 
     @property
     def byoc_configured(self) -> bool:
-        return self.byoc_api_key is not None
+        return _secret_configured(self.byoc_api_key)
 
     @property
     def task_payload_configured(self) -> bool:
-        return self.task_payload_key is not None
+        return _secret_configured(self.task_payload_key)
+
+
+def _secret_configured(value: SecretStr | None) -> bool:
+    return value is not None and bool(value.get_secret_value().strip())
 
 
 @lru_cache

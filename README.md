@@ -51,7 +51,7 @@ uv run uvicorn app.main:app --reload
 - 当前库自检：`GET /internal/admin/db-info`
 - 迁移是否跑齐：`GET /internal/admin/migration-state`（`current` 应等于 `head`）
 
-启动时默认自动 `upgrade head`（`AUTO_MIGRATE=true`）。多进程/多副本部署建议关掉，改在发布流程里单独执行 `alembic upgrade head`，避免并发迁移。
+启动时默认**不会**自动迁移（`AUTO_MIGRATE` 默认 `false`）。开发环境用 `.env` 里的 `AUTO_MIGRATE=true` 或手动 `alembic upgrade head`；生产/多副本一律在发布流程里单独跑迁移，避免并发。
 
 ## AiLink VCC 对接
 
@@ -264,7 +264,7 @@ uv run ruff check .
 | `REGISTRY_USERNAME` | registry 用户名 |
 | `REGISTRY_PASSWORD` | registry 密码或 token |
 
-镜像地址是 `REGISTRY_HOST/REGISTRY_NAMESPACE/kt`。生产部署记得把 `AUTO_MIGRATE` 关掉，在发布流程里单独跑 `alembic upgrade head`。
+镜像地址是 `REGISTRY_HOST/REGISTRY_NAMESPACE/kt`。生产默认不自动迁移（`AUTO_MIGRATE=false`），发布流程里单独跑 `alembic upgrade head`。
 
 ## 命令速查
 
@@ -331,7 +331,7 @@ uv run python -m app.tools.api_keys revoke --prefix kt_a1b2c3d4
 | `POOL_RECYCLE_SECONDS` | `3600` | MySQL 连接回收秒数 |
 | `API_PREFIX` | `/api` | 业务路由前缀；Webhook 不受它影响 |
 | `CORS_ORIGINS` | `[]` | 允许的跨域来源，JSON 数组 |
-| `AUTO_MIGRATE` | `true` | 启动时自动 `alembic upgrade head`；多副本要关掉 |
+| `AUTO_MIGRATE` | `false` | 启动时是否自动 `alembic upgrade head`；开发可设为 `true`，生产保持关闭 |
 | `AILINK_BASE_URL` | `https://card.ailinkvcc.com` | VCC 开放 API 域名 |
 | `AILINK_API_KEY` | 空 | VCC API Key |
 | `AILINK_API_SECRET` | 空 | VCC API Secret，只用于请求签名 |
