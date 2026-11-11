@@ -245,6 +245,27 @@ uv run ruff check .
 - 多副本部署时把限流配额按副本数拆分，或换数据库跨副本计数。
 - 卡余额目前按 webhook 记账，后续可以加定时对账。
 
+## 容器与 CI
+
+`Dockerfile` 用 `uv sync --frozen --no-dev` 构建，运行镜像基于 `python:3.12-slim`，非 root，暴露 8000，带 `/health` 健康检查。
+
+`.github/workflows/docker.yml` 的行为：
+
+- PR 只跑质量门（ruff + pytest），不推镜像。
+- 推 `main` 或 `v*` tag 时构建并推送到私有 registry；镜像只打短 sha tag（7 位），例如 `registry.example.com/team/kt:8866e92`。
+- 构建缓存用 GitHub Actions cache，不依赖 registry。
+
+仓库 Secrets 需要配：
+
+| Secret | 说明 |
+| --- | --- |
+| `REGISTRY_HOST` | 私有 registry 域名，例如 `registry.example.com` |
+| `REGISTRY_NAMESPACE` | 命名空间/项目，例如 `team` |
+| `REGISTRY_USERNAME` | registry 用户名 |
+| `REGISTRY_PASSWORD` | registry 密码或 token |
+
+镜像地址是 `REGISTRY_HOST/REGISTRY_NAMESPACE/kt`。生产部署记得把 `AUTO_MIGRATE` 关掉，在发布流程里单独跑 `alembic upgrade head`。
+
 ## 命令速查
 
 ### 开发
@@ -274,6 +295,13 @@ DATABASE_URL='mysql+pymysql://用户:密码@主机:3306/kt?charset=utf8mb4' uv r
 uv run ruff check .
 uv run ruff format --check app migrations tests
 uv run pytest
+```
+
+### 容器
+
+```bash
+docker build -t registry.example.com/team/kt:local .
+docker run --rm -p 8000:8000 --env-file .env registry.example.com/team/kt:local
 ```
 
 ### 演示数据
