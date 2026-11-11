@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings
 from app.internal import admin
 from app.migrations import upgrade_to_head
-from app.routers import items, users
+from app.routers import items, users, webhooks
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,6 +39,8 @@ if settings.cors_origins:
 
 app.include_router(items.router, prefix=settings.api_prefix)
 app.include_router(users.router, prefix=settings.api_prefix)
+# Webhook 地址是填到 VCC 后台的，不挂在可配置的 api_prefix 下，避免改前缀时丢事件
+app.include_router(webhooks.router)
 app.include_router(admin.router)
 
 

@@ -16,9 +16,12 @@ app/
 ├── models.py        # 数据表模型 + 请求/响应模型 + 命名约定
 ├── crud.py          # 数据访问（唯一碰 Session 的层）
 ├── migrations.py    # 以代码方式调用 Alembic
+├── integrations/    # 外部服务对接
+│   └── ailink/      # AiLink VCC 客户端、事件模型、Webhook 验签与分发
 ├── routers/
 │   ├── items.py
-│   └── users.py
+│   ├── users.py
+│   └── webhooks.py  # POST /webhooks/ailink：VCC 事件统一入口
 └── internal/
     └── admin.py     # 运维接口：库信息、迁移状态、手工迁移
 migrations/
@@ -48,6 +51,61 @@ uv run uvicorn app.main:app --reload
 - 迁移是否跑齐：`GET /internal/admin/migration-state`（`current` 应等于 `head`）
 
 启动时默认自动 `upgrade head`（`AUTO_MIGRATE=true`）。多进程/多副本部署建议关掉，改在发布流程里单独执行 `alembic upgrade head`，避免并发迁移。
+
+## AiLink VCC 对接
+
+配置 `AILINK_API_KEY` / `AILINK_API_SECRET` 后可以调开放 API；Webhook 端点还需要 `AILINK_WEBHOOK_SECRET`。
+`AILINK_WEBHOOK_SECRET` 同时用于验签和卡三要素解密，不会出现在日志里。
+
+```python
+from decimal import Decimal
+
+from app.integrations.ailink import AiLinkClient, new_request_no
+from app.integrations.ailink.models import CardApplyRequest
+
+async with AiLinkClient.from_settings() as client:
+    bins = await client.list_card_bins()          # 开卡配额看 bins.quota
+    balance = await client.get_account_balance()  # USD / USDT
+    await client.convert_balance("USDT", "USD", Decimal("100.00"))
+    await client.apply_cards(
+        CardApplyRequest(
+            request_no=new_request_no("kaika_"),
+            card_type="PREPAID",
+            card_bin_id=bins.bins[0].bin_id,
+            recharge_amount=Decimal("100.00"),
+        )
+    )
+```
+
+- 同步响应只代表受理：申请卡返回 `SUCCESS` 时 `initialFundingStatus` 仍可能是 `PENDING`，首充结果以 Webhook 为准。
+- 500 / 超时都是“结果未知”，保留 `requestId` 和原 `requestNo` 找平台核对，不要换号重提。
+
+### Webhook
+
+VCC 后台填 `https://<域名>/webhooks/ailink`，所有事件都推这里，按 `eventType` 分发：
+
+```
+POST /webhooks/ailink  →  验签 → parse_event → dispatcher → 纯文本 ok
+```
+
+- 成功必须返回 `2xx` + 正文 `ok`；处理器抛异常返回 500，平台按 1m/5m/15m/30m/1h/3h 重试。
+- 幂等键是 `eventId`，默认用进程内有界缓存；多副本部署请把 `EventStore` 换成共享存储。
+- 新增事件类型：在 `app/integrations/ailink/handlers/` 加一个 `@dispatcher.register` 的处理器即可，路由和分发器不用改。
+- 处理器拿到的 `event.data` 已类型化；卡号/有效期/CVV 只在 `event.data.decrypt_cards(secret)` 里显式解密，`repr` 不输出明文。
+
+```python
+from app.integrations.ailink.dispatch import EventContext, EventHandler
+from app.integrations.ailink.events import CardTransactionEvent
+from app.integrations.ailink.handlers import dispatcher
+
+@dispatcher.register
+class SettledToLedger(EventHandler[CardTransactionEvent]):
+    event_model = CardTransactionEvent
+    event_types = ("CARD_TRANSACTION.SETTLED",)
+
+    async def process(self, event: CardTransactionEvent, ctx: EventContext):
+        ...
+```
 
 ## 新增一条迁移
 

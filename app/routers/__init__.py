@@ -1,3 +1,1 @@
-from app.routers import items, users
-
-__all__ = ["items", "users"]
+"""HTTP 路由：每个资源一个模块，路由里只做参数、状态码和错误翻译。"""

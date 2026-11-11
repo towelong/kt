@@ -19,6 +19,8 @@ app/
 ├── models.py        # 表模型 + Create/Update/Public 模型 + naming_convention
 ├── crud.py          # 数据访问，唯一直接使用 Session 的层
 ├── migrations.py    # 以代码方式调用 Alembic
+├── integrations/    # 外部服务对接（每个 vendor 一个子包）
+│   └── ailink/      # AiLink VCC 客户端、事件模型、Webhook 验签与分发
 ├── routers/         # 只做 HTTP：参数、状态码、错误翻译
 └── internal/        # 不属于某个资源的内部/运维逻辑
 migrations/          # Alembic 环境与版本脚本，必须入库
@@ -31,6 +33,8 @@ tests/
 - `crud` 里不出现 `HTTPException`、`Request`、状态码。业务异常用 `crud.NotFoundError` / `crud.ConflictError`，由路由翻译成 404 / 409。
 - 跨资源的复用逻辑放 `dependencies.py`，不要放进某个 router 供别的 router import。
 - 运维/维护类接口放 `internal/`，不塞进业务 router。
+- 外部 HTTP 服务统一封装在 `app/integrations/<vendor>/`：签名、重试、错误翻译、事件模型都在里面，路由只做「解析请求 → 调集成层 → 翻译响应」。
+- 集成层的密钥只从 `Settings` 取，类型用 `SecretStr`；日志和异常里不出现明文、不打印请求/响应正文。
 
 ## 双库硬约束
 

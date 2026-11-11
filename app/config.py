@@ -3,6 +3,7 @@
 from functools import lru_cache
 from typing import Literal
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL, make_url
 
@@ -29,6 +30,24 @@ class Settings(BaseSettings):
     cors_origins: list[str] = []
     # 启动时自动执行 alembic upgrade head；多进程部署建议关掉，改在发布流程里跑
     auto_migrate: bool = True
+
+    # AiLink VCC 开放 API。Key/Secret 用 SecretStr，避免 repr、日志、异常里意外带出明文
+    ailink_base_url: str = "https://card.ailinkvcc.com"
+    ailink_api_key: SecretStr | None = None
+    ailink_api_secret: SecretStr | None = None
+    ailink_webhook_secret: SecretStr | None = None
+    ailink_timeout_seconds: float = 10.0
+    # Webhook 正文上限，默认 1 MiB；开卡批次事件会稍大，但远小于这个值
+    ailink_webhook_max_body_bytes: int = 1024 * 1024
+
+    @property
+    def ailink_configured(self) -> bool:
+        """Key/Secret 都配了才能调开放 API。"""
+        return self.ailink_api_key is not None and self.ailink_api_secret is not None
+
+    @property
+    def ailink_webhook_configured(self) -> bool:
+        return self.ailink_webhook_secret is not None
 
 
 @lru_cache
