@@ -18,10 +18,11 @@ app/
 ├── migrations.py    # 以代码方式调用 Alembic
 ├── integrations/    # 外部服务对接
 │   └── ailink/      # AiLink VCC 客户端、事件模型、Webhook 验签与分发
+├── services/        # 业务编排：卡事件落库、卡库存策略
+├── jobs/            # 定时任务：卡库存扫描
 ├── routers/
-│   ├── items.py
-│   ├── users.py
-│   └── webhooks.py  # POST /webhooks/ailink：VCC 事件统一入口
+│   ├── subscriptions.py  # POST /api/subscriptions：订阅任务投递
+│   └── webhooks.py       # POST /webhooks/ailink：VCC 事件统一入口
 └── internal/
     └── admin.py     # 运维接口：库信息、迁移状态、手工迁移
 migrations/
@@ -107,12 +108,92 @@ class SettledToLedger(EventHandler[CardTransactionEvent]):
         ...
 ```
 
+### 卡库存与计数
+
+`CARD_STOCK_ENABLED=true` 后，lifespan 里会起一个进程内任务（`app/jobs/card_stock.py`），每 `CARD_STOCK_INTERVAL_SECONDS` 扫一轮：
+
+| 套餐 | 单价 | 首充（3 次） |
+| --- | --- | --- |
+| plus | 16 | 48 |
+| pro100 | 90 | 270 |
+| pro200 | 150 | 450 |
+| pro500 | 470 | 1410 |
+
+- 可用卡 = `enabled` 且 `used_count < 3`；余额只做记录，不参与判定。
+- 缺卡时先查账户余额：USD 够直接开；不够按 `CARD_STOCK_USDT_USD_RATE`（默认 0.997）把缺口折成 USDT 兑换，兑换后重新查余额；两边都不够打 `error` 日志并跳过本轮。
+- 卡 BIN 只按发卡地区筛 `issuingCountry=US`，卡类型、币种、最低金额都不再额外限制；配额用尽时打 error。
+- 开卡前先写 `card` 占位行（`request_no` 唯一，含套餐名），超时后下一轮不会重复提交；三要素等开卡 Webhook 补齐后才 `enabled`。
+- 交易 Webhook 按 `transaction_id` 落 `card_transaction`：`AUTH_SUCCESS` +1、`AUTH_FAILED` -1、退款/撤销 -1（最低 0）；`SETTLED` 扣 `actual_amount`，退款/撤销加回。每个 transaction 只计一次，重复投递无害。
+- 次数到 3 自动停用，退款把次数降回来会重新启用。
+- 多副本部署靠 `job_lease` 抢锁，同一时间只有一个实例真正扫描。
+
+想直接看表效果，可以往当前 `DATABASE_URL`（默认 `app.db`）灌一份演示数据：
+
+```bash
+uv run python -m tests.seed_app_db
+```
+
+会写入 4 张卡（plus/pro100/pro200/pro500）和 7 条交易流水（授权、清算、失败、退款、处理中），按 `request_no` / `transaction_id` 去重，重复执行不会翻倍，也不会删已有数据。单元测试本身仍跑在临时库，不碰 `app.db`。
+
+## 订阅开通（BYOC）
+
+关掉 `SUBSCRIPTION_WORKER_ENABLED` 时接口只入库不执行；打开前必须配 `BYOC_API_KEY` 和 `TASK_PAYLOAD_KEY`。
+
+```
+POST /api/subscriptions
+{"plan": "plus", "session": {...完整 Session...}, "callback_url": "https://merchant/cb"}
+→ 202 {"task_id": 1, "request_id": "order-2026...", "status": "pending"}
+
+GET /api/subscriptions/{task_id}   # 兜底查询，不返回 session
+```
+
+### 鉴权
+
+两个接口都要带 `X-API-Key`；key 只存 sha256 和前 11 位前缀，完整值只在创建时打印一次。
+
+```bash
+uv run python -m app.tools.api_keys create --name partner-a --expires-in-days 365
+uv run python -m app.tools.api_keys list
+uv run python -m app.tools.api_keys revoke --prefix kt_a1b2c3d4
+```
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/subscriptions \
+  -H "X-API-Key: kt_xxx" -H "Content-Type: application/json" \
+  -d '{"plan":"plus","session":{...},"callback_url":"https://merchant/cb"}'
+```
+
+- 缺 key / 错 key → 401；已吊销或过期 → 403。
+- `GET` 只能查自己 key 提交的任务，别的 key 一律 404，不暴露任务是否存在。
+- 卡库存、补卡任务和 VCC Webhook 不用这套鉴权。
+
+worker（`app/jobs/task_worker.py`）执行顺序：
+
+1. 抢任务（条件 UPDATE，多副本只跑一次）。
+2. 按内部套餐选卡并锁定：`enabled`、`used_count < 3`、三要素齐全、余额 ≥ 报价、未过期、未被别的任务锁住。
+3. 没有卡 → `waiting_card` 并投递 `open_card` 任务，补卡后再试。
+4. `GET /quotes/{byoc_plan_type}?billing_country=...` 取 `quote_id` 和金额，过期就重新报价。
+5. 组单 → `POST /orders/validate` → `POST /orders`，同一个 `request_id`、同一份 JSON。
+6. 只认 BYOC 的订单状态：`completed + PAID` 成功，`failed/cancelled` 失败，`requires_action` 等 3DS；超时按原 `request_id` 找回，不换号重提。
+7. 成功/失败释放卡锁；结果未知保留锁等核对；终态清空 session 密文并回调。
+
+套餐映射（BYOC 的名字和内部不一样）：
+
+| 内部 | BYOC `plan_type` | billing_country |
+| --- | --- | --- |
+| plus | plus | ph |
+| pro100 | pro5 | eg |
+| pro200 | pro20 | ph |
+| pro500 | promax | eg |
+
+回调 body 拍平后按 key 升序拼 `k=v&...`，末尾拼 `BYOC_CALLBACK_SECRET` 做 MD5 hex，放在 `Kt-Secret` 头里；失败按 1m/5m/15m/1h 重试。session 和卡三要素只存在于加密 payload 和内存里，接口、日志、回调都不出现。
+
 ## 新增一条迁移
 
 ```bash
 # 1. 改 app/models.py
 # 2. 生成（需要连得上当前 DATABASE_URL）
-uv run alembic revision --autogenerate -m "add item sku"
+uv run alembic revision --autogenerate -m "add card remark"
 uv run ruff format migrations/versions
 # 3. 一定要打开 migrations/versions/xxx.py 检查：autogenerate 不认重命名，
 #    删列/改类型要自己补数据迁移
@@ -160,5 +241,85 @@ uv run ruff check .
 
 ## 接下来
 
-- 鉴权：在 `dependencies.py` 加 `CurrentUser` 依赖，`internal/admin.py` 必须挂上管理员校验。
-- 种子数据：写成 `migrations/versions` 里的数据迁移，别塞进启动逻辑。
+- `internal/admin.py` 还没有鉴权，上线前必须加管理员校验。
+- 多副本部署时把限流配额按副本数拆分，或换数据库跨副本计数。
+- 卡余额目前按 webhook 记账，后续可以加定时对账。
+
+## 命令速查
+
+### 开发
+
+```bash
+uv sync
+cp .env.example .env
+uv run uvicorn app.main:app --reload
+uv run python -c "import sys; print(sys.executable)"   # 确认解释器
+```
+
+### 迁移
+
+```bash
+uv run alembic upgrade head
+uv run alembic revision --autogenerate -m "add card remark"
+uv run ruff format migrations/versions
+uv run alembic downgrade -1
+uv run alembic downgrade base
+uv run alembic check
+DATABASE_URL='mysql+pymysql://用户:密码@主机:3306/kt?charset=utf8mb4' uv run alembic upgrade head --sql
+```
+
+### 质量门
+
+```bash
+uv run ruff check .
+uv run ruff format --check app migrations tests
+uv run pytest
+```
+
+### 演示数据
+
+```bash
+uv run python -m tests.seed_app_db
+```
+
+### API Key
+
+```bash
+uv run python -m app.tools.api_keys create --name partner-a --expires-in-days 365
+uv run python -m app.tools.api_keys list
+uv run python -m app.tools.api_keys revoke --prefix kt_a1b2c3d4
+```
+
+## 环境变量
+
+全部来自环境变量或 `.env`；带 Secret 的字段用 `SecretStr`，不会出现在 repr 和日志里。
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `DATABASE_URL` | `sqlite:///./app.db` | 数据库连接串；MySQL 用 `mysql+pymysql://用户名:密码@主机:3306/库名?charset=utf8mb4` |
+| `APP_NAME` | `kt` | 应用名，显示在 OpenAPI 标题上 |
+| `DEBUG` | `false` | 打开后 SQLAlchemy 打印 SQL |
+| `POOL_SIZE` / `MAX_OVERFLOW` | `5` / `10` | MySQL 连接池大小，SQLite 不用 |
+| `POOL_RECYCLE_SECONDS` | `3600` | MySQL 连接回收秒数 |
+| `API_PREFIX` | `/api` | 业务路由前缀；Webhook 不受它影响 |
+| `CORS_ORIGINS` | `[]` | 允许的跨域来源，JSON 数组 |
+| `AUTO_MIGRATE` | `true` | 启动时自动 `alembic upgrade head`；多副本要关掉 |
+| `AILINK_BASE_URL` | `https://card.ailinkvcc.com` | VCC 开放 API 域名 |
+| `AILINK_API_KEY` | 空 | VCC API Key |
+| `AILINK_API_SECRET` | 空 | VCC API Secret，只用于请求签名 |
+| `AILINK_WEBHOOK_SECRET` | 空 | Webhook 验签 + 卡三要素解密；不配就不收 Webhook、不解密 |
+| `AILINK_TIMEOUT_SECONDS` | `10` | VCC 请求超时 |
+| `AILINK_WEBHOOK_MAX_BODY_BYTES` | `1048576` | Webhook 正文上限，超出返回 413 |
+| `CARD_STOCK_ENABLED` | `false` | 是否启动卡库存扫描任务 |
+| `CARD_STOCK_INTERVAL_SECONDS` | `300` | 扫描间隔 |
+| `CARD_STOCK_PENDING_MINUTES` | `30` | 有未完成开卡申请时，这段时间内不重复开卡 |
+| `CARD_STOCK_USDT_USD_RATE` | `0.997` | USDT→USD 折算率，10 USDT 约 9.97 USD |
+| `BYOC_BASE_URL` | `https://wangbohui.com` | BYOC 站点地址，只接受 HTTPS |
+| `BYOC_API_KEY` | 空 | BYOC API Key，放在 `X-API-Key` |
+| `BYOC_CALLBACK_SECRET` | 空 | 回调签名密钥，拼在 `k=v&...` 后面做 MD5 |
+| `TASK_PAYLOAD_KEY` | 空 | 任务 payload 的 AES-256-GCM 密钥；32 字节 base64 或任意字符串（内部 SHA256 派生） |
+| `SUBSCRIPTION_WORKER_ENABLED` | `false` | 是否启动订阅任务 worker |
+| `SUBSCRIPTION_WORKER_INTERVAL_SECONDS` | `10` | worker 轮询间隔 |
+| `SUBSCRIPTION_CALLBACK_MAX_ATTEMPTS` | `5` | 回调最多尝试几次，超过后放弃 |
+| `AILINK_RATE_LIMIT_PER_MINUTE` | `450` | AiLink 每分钟请求上限；重试和只读 429 重试也占配额 |
+| `BYOC_RATE_LIMIT_PER_MINUTE` | `300` | BYOC 每分钟请求上限；create 重试、recover 也占配额 |

@@ -18,7 +18,13 @@ def test_upgrade_and_downgrade(db_url):
     command.upgrade(cfg, "head")
     engine = create_engine(db_url)
     tables = set(inspect(engine).get_table_names())
-    assert {"item", "user", "alembic_version"} <= tables
+    assert {
+        "alembic_version",
+        "card",
+        "card_transaction",
+        "job_lease",
+        "task",
+    } <= tables
     engine.dispose()
 
     command.downgrade(cfg, "base")
@@ -34,7 +40,7 @@ def test_downgrade_then_upgrade_again(db_url):
     command.upgrade(cfg, "head")
 
     engine = create_engine(db_url)
-    assert "user" in inspect(engine).get_table_names()
+    assert "card" in inspect(engine).get_table_names()
     engine.dispose()
 
 

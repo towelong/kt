@@ -1,6 +1,7 @@
 """引擎与会话：SQLite / MySQL 的差异只在这里出现一次。"""
 
 from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 from sqlalchemy import event
@@ -53,8 +54,15 @@ def get_session() -> Iterator[Session]:
         yield session
 
 
+@contextmanager
+def session_scope() -> Iterator[Session]:
+    """非 HTTP 场景（定时任务、Webhook 处理器）用的会话；事务边界仍在 crud 里。"""
+    with Session(engine) as session:
+        yield session
+
+
 def engine_info() -> dict[str, Any]:
     return {"dialect": engine.dialect.name, "url": safe_url()}
 
 
-__all__ = ["engine", "engine_info", "get_session", "safe_url"]
+__all__ = ["engine", "engine_info", "get_session", "safe_url", "session_scope"]

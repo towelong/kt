@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import secrets
@@ -41,6 +42,7 @@ from app.integrations.ailink.models import (
     validate_payload,
 )
 from app.integrations.ailink.signing import request_signature
+from app.integrations.ratelimit import RateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +73,8 @@ class AiLinkClient:
         timeout: float = 10.0,
         transport: httpx.AsyncBaseTransport | None = None,
         http_client: httpx.AsyncClient | None = None,
+        limiter: RateLimiter | None = None,
+        sleep=None,
     ) -> None:
         if not base_url or not api_key or not api_secret:
             raise AiLinkConfigError("AiLinkClient 需要 base_url、api_key、api_secret")
@@ -78,6 +82,8 @@ class AiLinkClient:
         self._api_key = api_key
         self._api_secret = api_secret
         self._owns_client = http_client is None
+        self._limiter = limiter if limiter is not None else RateLimiter("ailink", 450)
+        self._sleep = sleep if sleep is not None else asyncio.sleep
         self._client = http_client or httpx.AsyncClient(
             base_url=self.base_url,
             timeout=httpx.Timeout(timeout, connect=min(timeout, 5.0)),
@@ -86,15 +92,22 @@ class AiLinkClient:
         )
 
     @classmethod
-    def from_settings(cls, settings: Settings | None = None) -> Self:
+    def from_settings(
+        cls,
+        settings: Settings | None = None,
+        *,
+        limiter: RateLimiter | None = None,
+    ) -> Self:
         settings = settings or get_settings()
         if settings.ailink_api_key is None or settings.ailink_api_secret is None:
             raise AiLinkConfigError("未配置 AILINK_API_KEY / AILINK_API_SECRET，无法调用 VCC")
+        limiter = limiter or RateLimiter("ailink", settings.ailink_rate_limit_per_minute)
         return cls(
             base_url=settings.ailink_base_url,
             api_key=settings.ailink_api_key.get_secret_value(),
             api_secret=settings.ailink_api_secret.get_secret_value(),
             timeout=settings.ailink_timeout_seconds,
+            limiter=limiter,
         )
 
     async def aclose(self) -> None:
@@ -111,7 +124,7 @@ class AiLinkClient:
 
     async def list_card_bins(self, *, request_id: str | None = None) -> CardBinResult:
         """获取卡 BIN；开卡配额看 quota，不要看单条 BIN 上的兼容字段。"""
-        data = await self._post(PATH_CARD_BINS, {}, request_id=request_id)
+        data = await self._post_read(PATH_CARD_BINS, {}, request_id=request_id)
         return validate_payload(
             CardBinResult,
             {"quota": data.get("quota"), "bins": data.get("list") or []},
@@ -120,7 +133,7 @@ class AiLinkClient:
 
     async def get_account_balance(self, *, request_id: str | None = None) -> AccountBalanceResult:
         """主账户 USD / USDT 余额，含冻结金额和可用余额。"""
-        data = await self._post(PATH_ACCOUNT_BALANCE, {}, request_id=request_id)
+        data = await self._post_read(PATH_ACCOUNT_BALANCE, {}, request_id=request_id)
         return validate_payload(AccountBalanceResult, data, "获取账户余额")
 
     async def convert_balance(
@@ -160,6 +173,21 @@ class AiLinkClient:
 
     # ------------------------------------------------------------------ 内部实现
 
+    async def _post_read(
+        self,
+        path: str,
+        payload: Mapping[str, Any],
+        *,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        """只读接口遇到 429 按 Retry-After 重试一次；资金操作绝不走这里。"""
+        try:
+            return await self._post(path, payload, request_id=request_id)
+        except AiLinkRateLimitError as exc:
+            delay = _retry_after_seconds(exc.retry_after, default=1.0)
+            await self._sleep(delay)
+            return await self._post(path, payload, request_id=request_id)
+
     async def _post(
         self,
         path: str,
@@ -188,6 +216,7 @@ class AiLinkClient:
         }
 
         logger.debug("VCC 请求 POST %s requestId=%s", path, request_id)
+        await self._limiter.acquire()
         try:
             response = await self._client.post(path, content=body, headers=headers)
         except httpx.TimeoutException as exc:
@@ -253,7 +282,18 @@ class AiLinkClient:
             request_id=resp_request_id or request_id,
             status_code=response.status_code,
             code=code,
+            retry_after=response.headers.get("Retry-After"),
         )
+
+
+def _retry_after_seconds(value: str | None, *, default: float) -> float:
+    if value is None:
+        return default
+    try:
+        seconds = float(value)
+    except ValueError:
+        return default
+    return min(max(seconds, 0.0), 5.0)
 
 
 def new_request_no(prefix: str = "kaika_") -> str:

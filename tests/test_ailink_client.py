@@ -28,12 +28,30 @@ from app.integrations.ailink.signing import request_signature
 API_SECRET = "sk_test_secret"
 
 
-def make_client(handler: Any) -> AiLinkClient:
+class RecordingLimiter:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def acquire(self, *, max_wait=None) -> None:
+        self.calls += 1
+
+
+class RecordingSleep:
+    def __init__(self) -> None:
+        self.calls: list[float] = []
+
+    async def __call__(self, seconds: float) -> None:
+        self.calls.append(seconds)
+
+
+def make_client(handler: Any, limiter=None, sleep=None) -> AiLinkClient:
     return AiLinkClient(
         base_url="https://card.example.test",
         api_key="ak_test",
         api_secret=API_SECRET,
         transport=httpx.MockTransport(handler),
+        limiter=limiter,
+        sleep=sleep,
     )
 
 
@@ -260,6 +278,56 @@ async def test_envelope_code_with_http_200_is_business_error():
             await client.convert_balance("USD", "USDT", Decimal("1.00"))
 
     assert info.value.request_id == "req_x"
+
+
+async def test_read_endpoint_retries_429_once():
+    requests: list[int] = []
+    limiter = RecordingLimiter()
+    sleep = RecordingSleep()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(1)
+        if len(requests) == 1:
+            return httpx.Response(
+                429,
+                json={"code": 429, "msg": "too many requests", "requestId": "req_429"},
+                headers={"Retry-After": "0"},
+            )
+        return httpx.Response(200, json=BALANCE_RESPONSE)
+
+    async with make_client(handler, limiter=limiter, sleep=sleep) as client:
+        result = await client.get_account_balance()
+
+    assert result.get("USD") is not None
+    assert len(requests) == 2
+    assert limiter.calls == 2
+    assert sleep.calls == [0.0]
+
+
+async def test_fund_operation_does_not_retry_on_429():
+    requests: list[int] = []
+    limiter = RecordingLimiter()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(1)
+        return httpx.Response(
+            429,
+            json={"code": 429, "msg": "too many requests", "requestId": "req_429"},
+            headers={"Retry-After": "0"},
+        )
+
+    request = CardApplyRequest(
+        request_no="kaika_202606250001ab",
+        card_type="PREPAID",
+        card_bin_id=1001,
+        recharge_amount=Decimal("100"),
+    )
+    async with make_client(handler, limiter=limiter) as client:
+        with pytest.raises(AiLinkRateLimitError):
+            await client.apply_cards(request)
+
+    assert len(requests) == 1
+    assert limiter.calls == 1
 
 
 async def test_non_json_success_response_is_protocol_error():

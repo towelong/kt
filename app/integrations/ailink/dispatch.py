@@ -69,6 +69,8 @@ class EventContext:
     event_category: str
     merchant_id: int
     received_at: datetime
+    # 处理器需要落库时用：由分发器注入，集成层不直接依赖具体数据库
+    session_scope: Callable[[], Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,11 +114,20 @@ HandlerDecorator = Callable[[HandlerClass], HandlerClass]
 
 
 class EventDispatcher:
-    def __init__(self, *, store: EventStore | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        store: EventStore | None = None,
+        session_scope: Callable[[], Any] | None = None,
+    ) -> None:
         self._store = store or MemoryEventStore()
+        self._session_scope = session_scope
         self._by_type: dict[str, list[EventHandler[Any]]] = {}
         self._by_category: dict[str, list[EventHandler[Any]]] = {}
         self._fallback: list[EventHandler[Any]] = []
+
+    def set_session_scope(self, session_scope: Callable[[], Any]) -> None:
+        self._session_scope = session_scope
 
     @property
     def store(self) -> EventStore:
@@ -171,6 +182,7 @@ class EventDispatcher:
             event_category=event.event_category,
             merchant_id=event.merchant_id,
             received_at=received_at or datetime.now(UTC),
+            session_scope=self._session_scope,
         )
         handlers = self.resolve(event)
         if await self._store.seen(event.event_id):

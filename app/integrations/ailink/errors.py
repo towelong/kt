@@ -18,12 +18,14 @@ class AiLinkError(Exception):
         request_id: str | None = None,
         status_code: int | None = None,
         code: int | None = None,
+        retry_after: str | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
         self.request_id = request_id
         self.status_code = status_code
         self.code = code
+        self.retry_after = retry_after
 
     def __str__(self) -> str:
         suffix = f"（requestId={self.request_id}）" if self.request_id else ""

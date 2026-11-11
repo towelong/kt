@@ -40,6 +40,28 @@ class Settings(BaseSettings):
     # Webhook 正文上限，默认 1 MiB；开卡批次事件会稍大，但远小于这个值
     ailink_webhook_max_body_bytes: int = 1024 * 1024
 
+    # 卡库存扫描：默认关闭，配好 Key/Secret 再打开
+    card_stock_enabled: bool = False
+    card_stock_interval_seconds: int = 300
+    # 占位卡在这段时间内没等到开卡 webhook，就先不重复开新卡
+    card_stock_pending_minutes: int = 30
+    # USDT→USD 折算率：10 USDT 约到账 9.97 USD
+    card_stock_usdt_usd_rate: float = 0.997
+
+    # BYOC 订阅（Strong Exchange）：下单前先取报价，订单只认 BYOC 的终态
+    byoc_base_url: str = "https://wangbohui.com"
+    byoc_api_key: SecretStr | None = None
+    byoc_callback_secret: SecretStr | None = None
+    # 任务里 session 落库用的 AES-256-GCM key：32 字节 base64，或任意字符串（内部 SHA256 派生）
+    task_payload_key: SecretStr | None = None
+    subscription_worker_enabled: bool = False
+    subscription_worker_interval_seconds: int = 10
+    subscription_callback_max_attempts: int = 5
+
+    # 平台限流：每个真实 HTTP 请求占一个配额，重试也占
+    ailink_rate_limit_per_minute: int = 450
+    byoc_rate_limit_per_minute: int = 300
+
     @property
     def ailink_configured(self) -> bool:
         """Key/Secret 都配了才能调开放 API。"""
@@ -48,6 +70,14 @@ class Settings(BaseSettings):
     @property
     def ailink_webhook_configured(self) -> bool:
         return self.ailink_webhook_secret is not None
+
+    @property
+    def byoc_configured(self) -> bool:
+        return self.byoc_api_key is not None
+
+    @property
+    def task_payload_configured(self) -> bool:
+        return self.task_payload_key is not None
 
 
 @lru_cache
