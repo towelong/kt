@@ -1,12 +1,10 @@
 """内部接口：不属于某个资源的运维/维护逻辑。默认不对外暴露，记得加鉴权。"""
 
-import logging
-
 from fastapi import APIRouter
 
-from app.db import engine_info, init_db
-
-logger = logging.getLogger(__name__)
+from app.config import get_settings
+from app.db import engine, engine_info
+from app.migrations import current_revision, head_revision, upgrade_to_head
 
 router = APIRouter(prefix="/internal/admin", tags=["internal"])
 
@@ -17,7 +15,16 @@ def db_info() -> dict:
     return engine_info()
 
 
-@router.post("/init-db", status_code=204)
-def init_database() -> None:
-    """手工建表，等价于启动时做的 create_all。"""
-    init_db()
+@router.get("/migration-state")
+def migration_state() -> dict[str, str | None]:
+    """当前版本 vs 代码里的最新版本，两者不一致就说明有迁移没跑。"""
+    return {
+        "current": current_revision(engine),
+        "head": head_revision(get_settings().database_url),
+    }
+
+
+@router.post("/migrate", status_code=204)
+def migrate() -> None:
+    """手工把库升到最新，等价于 alembic upgrade head。"""
+    upgrade_to_head()

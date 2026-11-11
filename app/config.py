@@ -4,6 +4,7 @@ from functools import lru_cache
 from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import URL, make_url
 
 
 class Settings(BaseSettings):
@@ -26,6 +27,8 @@ class Settings(BaseSettings):
 
     api_prefix: str = "/api"
     cors_origins: list[str] = []
+    # 启动时自动执行 alembic upgrade head；多进程部署建议关掉，改在发布流程里跑
+    auto_migrate: bool = True
 
 
 @lru_cache
@@ -40,3 +43,14 @@ def database_backend(url: str) -> Literal["sqlite", "mysql"]:
     if url.startswith("mysql"):
         return "mysql"
     raise ValueError(f"不支持的 DATABASE_URL：{url.split('://', 1)[0]}://...")
+
+
+def mask_url(url: str | URL) -> str:
+    """脱敏后的连接串，日志和运维接口用；不含凭据。"""
+    parsed = make_url(url) if isinstance(url, str) else url
+    if parsed.get_backend_name() == "sqlite":
+        return parsed.render_as_string()
+    return (
+        f"{parsed.drivername}://{parsed.username or ''}@"
+        f"{parsed.host or ''}:{parsed.port or 3306}/{parsed.database or ''}"
+    )

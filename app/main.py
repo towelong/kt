@@ -7,8 +7,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
-from app.db import init_db
 from app.internal import admin
+from app.migrations import upgrade_to_head
 from app.routers import items, users
 
 logging.basicConfig(
@@ -21,7 +21,8 @@ settings = get_settings()
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    init_db()
+    if settings.auto_migrate:
+        upgrade_to_head()
     yield
 
 

@@ -4,6 +4,16 @@ from datetime import UTC, datetime
 
 from sqlmodel import Field, SQLModel
 
+# 约束/索引名必须确定，否则 SQLite 上改表（batch 模式）和 MySQL 上的 drop 都会猜名字。
+# 名字也控制在 MySQL 的 64 字符标识符上限内。
+SQLModel.metadata.naming_convention = {
+    "ix": "ix_%(table_name)s_%(column_0_name)s",
+    "uq": "uq_%(table_name)s_%(column_0_name)s",
+    "ck": "ck_%(table_name)s_%(constraint_name)s",
+    "fk": "fk_%(table_name)s_%(column_0_name)s",
+    "pk": "pk_%(table_name)s",
+}
+
 
 def utcnow() -> datetime:
     """带时区的 UTC；SQLModel 的 UTCDateTime 负责在 MySQL 上落成无偏移的 UTC 值。"""

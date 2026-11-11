@@ -39,9 +39,7 @@ def list_items(
 ) -> tuple[int, list[Item]]:
     limit = max(1, min(limit, MAX_LIMIT))
     total = session.exec(select(func.count()).select_from(Item)).one()
-    rows = session.exec(
-        select(Item).order_by(col(Item.id)).offset(offset).limit(limit)
-    ).all()
+    rows = session.exec(select(Item).order_by(col(Item.id)).offset(offset).limit(limit)).all()
     return int(total), list(rows)
 
 
@@ -90,9 +88,7 @@ def list_users(
 ) -> tuple[int, list[User]]:
     limit = max(1, min(limit, MAX_LIMIT))
     total = session.exec(select(func.count()).select_from(User)).one()
-    rows = session.exec(
-        select(User).order_by(col(User.id)).offset(offset).limit(limit)
-    ).all()
+    rows = session.exec(select(User).order_by(col(User.id)).offset(offset).limit(limit)).all()
     return int(total), list(rows)
 
 

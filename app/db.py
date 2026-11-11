@@ -1,16 +1,13 @@
 """引擎与会话：SQLite / MySQL 的差异只在这里出现一次。"""
 
-import logging
 from collections.abc import Iterator
 from typing import Any
 
 from sqlalchemy import event
-from sqlalchemy.engine import Engine
-from sqlmodel import Session, SQLModel, create_engine
+from sqlalchemy.engine import URL
+from sqlmodel import Session, create_engine
 
-from app.config import get_settings
-
-logger = logging.getLogger(__name__)
+from app.config import get_settings, mask_url
 
 settings = get_settings()
 
@@ -46,23 +43,9 @@ if settings.database_url.startswith("sqlite"):
         cursor.close()
 
 
-def safe_url(url=None) -> str:
+def safe_url(url: str | URL | None = None) -> str:
     """打日志用，绝不带出凭据。"""
-    url = url or engine.url
-    if url.get_backend_name() == "sqlite":
-        return url.render_as_string()
-    return (
-        f"{url.drivername}://{url.username or ''}@"
-        f"{url.host or ''}:{url.port or 3306}/{url.database or ''}"
-    )
-
-
-def init_db() -> None:
-    """建表。生产环境应换成 alembic 迁移，骨架阶段先 create_all。"""
-    import app.models  # noqa: F401  让所有表注册到 SQLModel.metadata
-
-    SQLModel.metadata.create_all(engine)
-    logger.info("数据库已就绪：%s", safe_url())
+    return mask_url(url or engine.url)
 
 
 def get_session() -> Iterator[Session]:
@@ -74,4 +57,4 @@ def engine_info() -> dict[str, Any]:
     return {"dialect": engine.dialect.name, "url": safe_url()}
 
 
-__all__ = ["Engine", "engine", "engine_info", "get_session", "init_db", "safe_url"]
+__all__ = ["engine", "engine_info", "get_session", "safe_url"]

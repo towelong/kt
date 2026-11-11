@@ -74,3 +74,9 @@ def test_pagination(client):
 
 def test_db_info_reports_dialect(client):
     assert client.get("/internal/admin/db-info").json()["dialect"] == "sqlite"
+
+
+def test_migrations_applied_on_startup(client):
+    state = client.get("/internal/admin/migration-state").json()
+    assert state["current"] == state["head"]
+    assert state["current"] is not None
