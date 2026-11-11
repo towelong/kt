@@ -1,0 +1,30 @@
+[project]
+name = "kt"
+version = "0.1.0"
+description = "FastAPI + SQLModel 服务骨架（SQLite / MySQL 双库）"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "sqlmodel>=0.0.48",
+    "pydantic-settings>=2.4",
+    "pymysql>=1.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.27",
+    "ruff>=0.6",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

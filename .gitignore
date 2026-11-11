@@ -1,0 +1,9 @@
+# 本地环境
+.venv/
+__pycache__/
+*.py[cod]
+.env
+*.db
+*.sqlite3
+.pytest_cache/
+.ruff_cache/
