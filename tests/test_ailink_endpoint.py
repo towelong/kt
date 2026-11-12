@@ -1,16 +1,20 @@
 """Webhook 端点：验签、应答 ok、幂等、失败返回 500 让平台重试。"""
 
+import json
+import logging
 from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from starlette.requests import ClientDisconnect
 
 from app.config import Settings, get_settings
 from app.integrations.ailink.dispatch import EventDispatcher, EventHandler
 from app.integrations.ailink.events import WebhookEvent
-from app.routers.webhooks import get_dispatcher
+from app.routers.webhooks import get_dispatcher, receive_ailink_webhook
 from app.routers.webhooks import router as webhook_router
+from tests.conftest import build_webhook_headers
 
 WEBHOOK_SECRET = "whsec_test_secret"
 URL = "/webhooks/ailink"
@@ -140,3 +144,65 @@ def test_oversized_body_is_rejected(webhook, sign_webhook, card_issue_body):
     response = webhook.client.post(URL, content=card_issue_body, headers=headers)
 
     assert response.status_code == 413
+
+
+class _DisconnectRequest:
+    headers: dict = {}
+    client = None
+
+    async def body(self):
+        raise ClientDisconnect()
+
+
+async def test_webhook_client_disconnect_is_handled():
+    response = await receive_ailink_webhook(
+        _DisconnectRequest(),
+        Settings(_env_file=None),
+        EventDispatcher(),
+    )
+    assert response.status_code == 400
+    assert response.body == b"client disconnected"
+
+
+def test_rejected_request_logs_headers_and_redacted_body(webhook, caplog):
+    caplog.set_level(logging.WARNING, logger="app.routers.webhooks")
+    payload = {
+        "eventId": "evt_log_1",
+        "eventType": "CARD_3DS.OTP_RECEIVED",
+        "eventCategory": "CARD_3DS",
+        "eventTime": "2026-11-12 12:00:00",
+        "apiVersion": "2026-06-01",
+        "merchantId": 10001,
+        "data": {"otpCode": "387123", "cardNoMask": "4865****1234"},
+    }
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+    headers = build_webhook_headers(
+        body,
+        secret="wrong-secret",
+        event_id="evt_log_1",
+        event_type="CARD_3DS.OTP_RECEIVED",
+    )
+
+    response = webhook.client.post(URL, content=body, headers=headers)
+
+    assert response.status_code == 403
+    assert "VCC Webhook 验签失败" in caplog.text
+    assert "evt_log_1" in caplog.text  # header 有记录
+    assert '"otpCode":"***"' in caplog.text  # 敏感字段打码
+    assert "387123" not in caplog.text
+
+
+def test_debug_logs_successful_request(webhook, caplog, sign_webhook, card_issue_body):
+    caplog.set_level(logging.INFO, logger="app.routers.webhooks")
+    webhook_app.dependency_overrides[get_settings] = lambda: Settings(
+        _env_file=None,
+        ailink_webhook_secret=WEBHOOK_SECRET,
+        ailink_webhook_debug=True,
+    )
+    headers = sign_webhook(card_issue_body, event_id="evt_card_issue_1")
+
+    response = webhook.client.post(URL, content=card_issue_body, headers=headers)
+
+    assert response.status_code == 200
+    assert "VCC Webhook 收到请求" in caplog.text
+    assert "x-vcc-webhook-id" in caplog.text

@@ -180,6 +180,8 @@ CLAIMABLE_TASK_STATUSES = (
     "processing",
     "waiting_action",
     "unknown",
+    # 认领后 worker 崩溃的任务；只有 claimed_until 过期才会被重新抢到
+    "running",
 )
 
 
@@ -287,7 +289,6 @@ def list_due_callbacks(session: Session, now: datetime, limit: int = 20) -> list
 def find_subscription_candidates(
     session: Session,
     plan: str,
-    amount: Decimal,
     now: datetime,
 ) -> list[Card]:
     stmt = (
@@ -299,7 +300,6 @@ def find_subscription_candidates(
             Card.card_no.is_not(None),
             Card.expiry.is_not(None),
             Card.cvv.is_not(None),
-            Card.balance >= amount,
             or_(Card.reserved_until.is_(None), Card.reserved_until < now),
         )
         .order_by(col(Card.id))

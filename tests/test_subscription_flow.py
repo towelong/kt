@@ -24,8 +24,6 @@ from tests.test_subscriptions import (
 
 QUOTE_AMOUNT_MINOR = 2000
 CARD_OK = "VC_FLOW_OK"
-CARD_LOW = "VC_FLOW_LOW"
-LOW_CARD_NUMBER = "4000000000000002"
 
 
 class RecordingLimiter:
@@ -98,15 +96,6 @@ def callback_handler(captured: dict):
 
 
 async def test_subscription_end_to_end(db_session, session_factory, api_key):
-    # 一张余额不够、一张可用：worker 必须选可用的那张
-    make_card(
-        db_session,
-        plan="plus",
-        card_id=CARD_LOW,
-        request_no="kaika_plus_flow_low",
-        card_no=LOW_CARD_NUMBER,
-        balance=Decimal("1.00"),
-    )
     card_ok = make_card(
         db_session,
         plan="plus",
@@ -179,7 +168,6 @@ async def test_subscription_end_to_end(db_session, session_factory, api_key):
     assert sent["bill_name"] == "plus"
     assert sent["quote_id"] == "gxq1.flow"
     assert sent["card_number"] == card_ok.card_no
-    assert sent["card_number"] != LOW_CARD_NUMBER
     assert (sent["exp_month"], sent["exp_year"]) == (12, 2029)
     assert sent["cvv"] == "123"
     assert sent["session"]["accessToken"] == SESSION["accessToken"]

@@ -5,7 +5,7 @@ import json
 import httpx
 import pytest
 
-from app.integrations.byoc import ByocClient, OutcomeUnknown, PollTimeout
+from app.integrations.byoc import ByocClient, OrderValidationError, OutcomeUnknown, PollTimeout
 from app.integrations.byoc.errors import APIError
 
 API_KEY = "byoc_test_key"
@@ -114,6 +114,63 @@ async def test_validate_then_create_sends_same_order():
     assert seen[0][1] == seen[1][1] == payload
     assert result["task_id"] == "TASK0001"
     assert result["payment_success"] is True
+
+
+async def test_validate_accepts_preflight_response_without_order():
+    request_id = "order-2026100200012331"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/external/orders/validate"
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "valid": True,
+                "request_id": request_id,
+                "plan_type": "pro5",
+                "billing_country": "eg",
+                "quote_bound": True,
+                "idempotent_replay": False,
+                "would_create_new_order": True,
+                "accepting_orders": True,
+                "account_preflight_performed": True,
+            },
+        )
+
+    async with make_client(handler) as client:
+        result = await client.validate_order(
+            {"request_id": request_id, "plan_type": "pro5", "billing_country": "eg"}
+        )
+
+    assert result.valid is True
+    assert result.quote_bound is True
+    assert result.order is None
+
+
+async def test_validate_rejects_invalid_preflight():
+    request_id = "order-2026100200012332"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "valid": False,
+                "request_id": request_id,
+                "plan_type": "pro5",
+                "billing_country": "eg",
+                "quote_bound": False,
+                "accepting_orders": True,
+            },
+        )
+
+    async with make_client(handler) as client:
+        with pytest.raises(OrderValidationError) as info:
+            await client.validate_order(
+                {"request_id": request_id, "plan_type": "pro5", "billing_country": "eg"}
+            )
+
+    assert "valid != true" in str(info.value)
 
 
 async def test_create_conflict_recovers_original_order():

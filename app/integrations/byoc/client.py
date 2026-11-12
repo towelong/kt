@@ -21,7 +21,12 @@ from urllib.parse import quote, unquote, urlsplit
 
 import httpx
 
-from app.integrations.byoc.errors import APIError, OutcomeUnknown, PollTimeout
+from app.integrations.byoc.errors import (
+    APIError,
+    OrderValidationError,
+    OutcomeUnknown,
+    PollTimeout,
+)
 from app.integrations.ratelimit import RateLimiter
 
 
@@ -31,6 +36,17 @@ class _BudgetExceeded(Exception):
 
 class _InvalidResponse(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class OrderValidation:
+    request_id: str
+    valid: bool
+    quote_bound: bool | None = None
+    accepting_orders: bool | None = None
+    would_create_new_order: bool | None = None
+    idempotent_replay: bool | None = None
+    order: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -293,16 +309,61 @@ class ByocClient:
             pricing_version=data.get("pricing_version"),
         )
 
-    async def validate_order(self, order, *, timeout=60):
+    async def validate_order(self, order, *, timeout=60) -> OrderValidation:
+        """校验订单。真实接口在“还没建单”时返回 valid/quote_bound，没有 order 字段。"""
         if not isinstance(order, dict):
             raise ValueError("order 必须是 dict")
+        request_id = order.get("request_id")
         try:
             data = await self._call(
                 "POST", "/orders/validate", self._deadline(timeout), deepcopy(order)
             )
-            return self._order(data, request_id=order.get("request_id"))
-        except (_BudgetExceeded, _InvalidResponse):
+        except _BudgetExceeded:
             raise PollTimeout("/orders/validate") from None
+        except _InvalidResponse:
+            raise OrderValidationError("响应不是 ok=true") from None
+
+        if not isinstance(data, dict) or data.get("ok") is not True:
+            raise OrderValidationError("响应不是 ok=true", detail=data)
+
+        if "order" in data:
+            parsed = self._order(data, request_id=request_id)
+            return OrderValidation(
+                request_id=request_id or "",
+                valid=True,
+                idempotent_replay=data.get("idempotent_replay"),
+                order=parsed,
+            )
+
+        returned_request_id = data.get("request_id")
+        if returned_request_id != request_id:
+            raise OrderValidationError(
+                f"request_id 不匹配（返回 {returned_request_id}）",
+                detail=data,
+            )
+        plan_type = data.get("plan_type")
+        expected_plan = order.get("plan_type")
+        if isinstance(plan_type, str) and isinstance(expected_plan, str):
+            if plan_type.lower() != expected_plan.lower():
+                raise OrderValidationError(
+                    f"套餐不匹配（返回 {plan_type}，请求 {expected_plan}）",
+                    detail=data,
+                )
+        if data.get("valid") is not True:
+            raise OrderValidationError("valid != true", detail=data)
+        for flag in ("quote_bound", "accepting_orders"):
+            if data.get(flag) is False:
+                raise OrderValidationError(f"{flag}=false", detail=data)
+
+        return OrderValidation(
+            request_id=returned_request_id or "",
+            valid=True,
+            quote_bound=data.get("quote_bound"),
+            accepting_orders=data.get("accepting_orders"),
+            would_create_new_order=data.get("would_create_new_order"),
+            idempotent_replay=data.get("idempotent_replay"),
+            order=None,
+        )
 
     async def create_order(self, order, *, timeout=120):
         """先 validate 再建单；两步用同一份 JSON、同一个 request_id。"""

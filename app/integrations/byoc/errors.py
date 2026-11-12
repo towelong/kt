@@ -51,3 +51,12 @@ class PollTimeout(TimeoutError):
     def __init__(self, task_id):
         self.task_id = task_id
         super().__init__(f"查询等待时间已到；稍后继续查询原订单 {task_id}")
+
+
+class OrderValidationError(RuntimeError):
+    """BYOC validate 明确返回校验不通过（不是超时，不能当未知结果重试）。"""
+
+    def __init__(self, reason: str, *, detail=None):
+        self.reason = reason
+        self.detail = detail
+        super().__init__(f"订单校验未通过：{reason}")

@@ -50,6 +50,7 @@ PATH_CARD_BINS = "/openapi/v1/card-bins/query"
 PATH_ACCOUNT_BALANCE = "/openapi/v1/account/balance/query"
 PATH_ACCOUNT_CONVERT = "/openapi/v1/account/convert"
 PATH_CARDS_APPLY = "/openapi/v1/cards/apply"
+PATH_CARDS_QUERY = "/openapi/v1/cards/query"
 
 _ERROR_BY_STATUS: dict[int, type[AiLinkError]] = {
     400: AiLinkBusinessError,
@@ -158,6 +159,39 @@ class AiLinkClient:
             request_id=request_id,
         )
         return validate_payload(BalanceConvertResult, data, "账户余额兑换")
+
+    async def query_cards(
+        self,
+        *,
+        page_num: int = 1,
+        page_size: int = 20,
+        card_type: str | None = None,
+        card_status: str | None = None,
+        card_no: str | None = None,
+        last4: str | None = None,
+        batch_no: str | None = None,
+        remark: str | None = None,
+        begin_time: str | None = None,
+        end_time: str | None = None,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        """查平台卡列表；返回 data，含 total/pageNum/pageSize/list。"""
+        payload: dict[str, Any] = {
+            "pageNum": page_num,
+            "pageSize": page_size,
+        }
+        optional = {
+            "cardType": card_type,
+            "cardStatus": card_status,
+            "cardNo": card_no,
+            "last4": last4,
+            "batchNo": batch_no,
+            "remark": remark,
+            "beginTime": begin_time,
+            "endTime": end_time,
+        }
+        payload.update({key: value for key, value in optional.items() if value})
+        return await self._post(PATH_CARDS_QUERY, payload, request_id=request_id)
 
     async def apply_cards(
         self,

@@ -127,6 +127,15 @@ class SettledToLedger(EventHandler[CardTransactionEvent]):
 - 次数到 3 自动停用，退款把次数降回来会重新启用。
 - 多副本部署靠 `job_lease` 抢锁，同一时间只有一个实例真正扫描。
 
+平台已有卡可以一次性同步进本地 `card` 表（按 `cardId` 幂等，不会重复插入）：
+
+```bash
+uv run python -m app.tools.sync_cards --dry-run   # 先看会导入/更新哪些
+uv run python -m app.tools.sync_cards
+```
+
+列表只返回脱敏卡号，所以导入的卡不写 `card_no`/`expiry`/`cvv`、`enabled=false`，只用来对账余额和状态，不会被订阅选卡拿去交易；已有卡只更新余额、批次和停用状态。套餐从备注里推断，认不出就是 `unknown`。
+
 想直接看表效果，可以往当前 `DATABASE_URL`（默认 `app.db`）灌一份演示数据：
 
 ```bash
@@ -170,12 +179,12 @@ curl -X POST http://127.0.0.1:8000/api/subscriptions \
 worker（`app/jobs/task_worker.py`）执行顺序：
 
 1. 抢任务（条件 UPDATE，多副本只跑一次）。
-2. 按内部套餐选卡并锁定：`enabled`、`used_count < 3`、三要素齐全、余额 ≥ 报价、未过期、未被别的任务锁住。
+2. 按内部套餐选卡并锁定：`enabled`、`used_count < 3`、三要素齐全、未过期、未被别的任务锁住。余额和报价金额不做校验，资金充足由运营侧保证。
 3. 没有卡 → `waiting_card` 并投递 `open_card` 任务，补卡后再试。
-4. `GET /quotes/{byoc_plan_type}?billing_country=...` 取 `quote_id` 和金额，过期就重新报价。
+4. `GET /quotes/{byoc_plan_type}?billing_country=...` 取 `quote_id`，过期就重新报价；金额和币种原样保存供回调/对账，不参与校验。
 5. 组单 → `POST /orders/validate` → `POST /orders`，同一个 `request_id`、同一份 JSON。
 6. 只认 BYOC 的订单状态：`completed + PAID` 成功，`failed/cancelled` 失败，`requires_action` 等 3DS；超时按原 `request_id` 找回，不换号重提。
-7. 成功/失败释放卡锁；结果未知保留锁等核对；终态清空 session 密文并回调。
+7. validate 超时/网络异常释放卡锁、任务 30 秒后重试；建单后结果未知保留卡锁等 `recover` 核对，成功/失败释放；终态清空 session 密文并回调。
 
 套餐映射（BYOC 的名字和内部不一样）：
 
@@ -304,16 +313,18 @@ docker build -t registry.example.com/team/kt:local .
 docker run --rm -p 8000:8000 --env-file .env registry.example.com/team/kt:local
 ```
 
-### 演示数据
+### 演示数据 / 卡同步
 
 ```bash
 uv run python -m tests.seed_app_db
+uv run python -m app.tools.sync_cards --dry-run
+uv run python -m app.tools.sync_cards
 ```
 
 ### API Key
 
 ```bash
-uv run python -m app.tools.api_keys create --name partner-a --expires-in-days 365
+uv run python -m app.tools.api_keys create --name oai123 --expires-in-days 365
 uv run python -m app.tools.api_keys list
 uv run python -m app.tools.api_keys revoke --prefix kt_a1b2c3d4
 ```
@@ -338,6 +349,7 @@ uv run python -m app.tools.api_keys revoke --prefix kt_a1b2c3d4
 | `AILINK_WEBHOOK_SECRET` | 空 | Webhook 验签 + 卡三要素解密；不配就不收 Webhook、不解密 |
 | `AILINK_TIMEOUT_SECONDS` | `10` | VCC 请求超时 |
 | `AILINK_WEBHOOK_MAX_BODY_BYTES` | `1048576` | Webhook 正文上限，超出返回 413 |
+| `AILINK_WEBHOOK_DEBUG` | `false` | 排查开关：成功请求也打印 header/body，敏感字段自动打码；生产关闭 |
 | `CARD_STOCK_ENABLED` | `false` | 是否启动卡库存扫描任务 |
 | `CARD_STOCK_INTERVAL_SECONDS` | `300` | 扫描间隔 |
 | `CARD_STOCK_PENDING_MINUTES` | `30` | 有未完成开卡申请时，这段时间内不重复开卡 |

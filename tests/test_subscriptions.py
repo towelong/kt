@@ -14,7 +14,7 @@ from app.config import Settings, get_settings
 from app.db import get_session
 from app.integrations.byoc import OutcomeUnknown
 from app.integrations.byoc.client import Quote
-from app.integrations.byoc.errors import APIError
+from app.integrations.byoc.errors import APIError, OrderValidationError, PollTimeout
 from app.models import utcnow
 from app.routers.subscriptions import router as subscriptions_router
 from app.services.subscriptions import (
@@ -385,6 +385,84 @@ async def test_validation_rejection_fails_without_charging(db_session):
     assert card.reserved_until is None
 
 
+async def test_reuses_card_locked_by_same_task(db_session):
+    card = make_card(db_session, plan="plus")
+    task = new_task(db_session)
+    now = utcnow()
+    assert crud.claim_card(
+        db_session,
+        card.id,
+        task.request_id,
+        until=now + timedelta(minutes=5),
+        now=now,
+    )
+    task.card_id = card.id
+    crud.save_task(db_session, task)
+
+    byoc = FakeByoc()
+    await process_subscription_task(db_session, task, byoc=byoc, settings=make_settings())
+
+    db_session.refresh(task)
+    db_session.refresh(card)
+    assert task.status == "succeeded"
+    assert task.card_id is None
+    assert byoc.created[0]["card_number"] == card.card_no
+    assert card.reserved_until is None
+
+
+async def test_validation_error_fails_with_reason(db_session):
+    card = make_card(db_session, plan="plus")
+    task = new_task(db_session)
+
+    class InvalidByoc(FakeByoc):
+        async def validate_order(self, order, *, timeout=60):
+            raise OrderValidationError("quote_bound=false", detail={"quote_bound": False})
+
+    await process_subscription_task(db_session, task, byoc=InvalidByoc(), settings=make_settings())
+
+    db_session.refresh(task)
+    db_session.refresh(card)
+    assert task.status == "failed"
+    assert "quote_bound=false" in (task.last_error or "")
+    assert task.payload_ciphertext is None
+    assert card.reserved_until is None
+
+
+async def test_validate_timeout_releases_card(db_session):
+    card = make_card(db_session, plan="plus")
+    task = new_task(db_session)
+
+    class TimeoutByoc(FakeByoc):
+        async def validate_order(self, order, *, timeout=60):
+            raise PollTimeout("/orders/validate")
+
+    await process_subscription_task(db_session, task, byoc=TimeoutByoc(), settings=make_settings())
+
+    db_session.refresh(task)
+    db_session.refresh(card)
+    assert task.status == "pending"
+    assert task.card_id is None
+    assert task.payload_ciphertext is not None
+    assert card.reserved_until is None and card.reserved_task_id is None
+
+
+async def test_validate_network_error_releases_card(db_session):
+    card = make_card(db_session, plan="plus")
+    task = new_task(db_session)
+
+    class NetworkByoc(FakeByoc):
+        async def validate_order(self, order, *, timeout=60):
+            raise httpx.ConnectError("boom")
+
+    await process_subscription_task(db_session, task, byoc=NetworkByoc(), settings=make_settings())
+
+    db_session.refresh(task)
+    db_session.refresh(card)
+    assert task.status == "pending"
+    assert task.card_id is None
+    assert card.reserved_until is None
+
+
 async def test_conflict_recovery_uses_original_order(db_session):
     card = make_card(db_session, plan="plus")
     task = new_task(db_session)
@@ -407,13 +485,17 @@ async def test_conflict_recovery_uses_original_order(db_session):
     assert card.reserved_until is None
 
 
-async def test_quote_amount_above_plan_budget_fails(db_session):
-    make_card(db_session, plan="plus")
+async def test_quote_amount_is_not_validated(db_session):
+    card = make_card(db_session, plan="plus")
     task = new_task(db_session)
     byoc = FakeByoc(quote_result=quote(amount=999900))
 
     await process_subscription_task(db_session, task, byoc=byoc, settings=make_settings())
 
     db_session.refresh(task)
-    assert task.status == "failed"
-    assert "超过套餐首充" in (task.last_error or "")
+    db_session.refresh(card)
+    assert task.status == "succeeded"
+    assert task.authorized_amount_minor == 999900
+    assert task.display_amount == "USD $9999.00"
+    assert byoc.created and byoc.created[0]["quote_id"] == "gxq1.test"
+    assert card.reserved_until is None

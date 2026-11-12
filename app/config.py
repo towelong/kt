@@ -40,6 +40,8 @@ class Settings(BaseSettings):
     ailink_timeout_seconds: float = 10.0
     # Webhook 正文上限，默认 1 MiB；开卡批次事件会稍大，但远小于这个值
     ailink_webhook_max_body_bytes: int = 1024 * 1024
+    # 排查用：成功请求也打印 header/body（敏感字段会被打码）。生产保持 false
+    ailink_webhook_debug: bool = False
 
     # 卡库存扫描：默认关闭，配好 Key/Secret 再打开
     card_stock_enabled: bool = False

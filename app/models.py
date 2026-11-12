@@ -231,8 +231,8 @@ class Task(TimestampMixin, table=True):
     )
     quote_id: str | None = Field(
         default=None,
-        max_length=128,
-        description="最近一次报价的 quote_id，下单时原样带上",
+        sa_column=Column(Text, nullable=True),
+        description="最近一次报价的 quote_id，下单时原样带上（不限制长度）",
     )
     authorized_amount_minor: int | None = Field(
         default=None,

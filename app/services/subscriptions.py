@@ -21,8 +21,13 @@ from sqlmodel import Session
 from app import crud
 from app.config import Settings
 from app.integrations.byoc.client import ByocClient
-from app.integrations.byoc.errors import APIError, OutcomeUnknown, PollTimeout
-from app.models import Task, utcnow
+from app.integrations.byoc.errors import (
+    APIError,
+    OrderValidationError,
+    OutcomeUnknown,
+    PollTimeout,
+)
+from app.models import Card, Task, utcnow
 from app.services.card_stock import PLAN_BY_NAME, PlanSpec, replenish
 from app.services.task_payload import decrypt_payload, encrypt_payload
 
@@ -157,11 +162,9 @@ async def process_subscription_task(
         _finish_failed(session, task, f"未知套餐：{task.plan}", now)
         return
 
-    if task.byoc_task_id and task.status in {
-        STATUS_PROCESSING,
-        STATUS_WAITING_ACTION,
-        STATUS_UNKNOWN,
-    }:
+    # worker 认领后状态一定是 running，不能用 task.status 判断是否已经建过单；
+    # 只要拿到过 byoc_task_id，就只轮询/找回，不再依赖 session 密文。
+    if task.byoc_task_id or not task.payload_ciphertext:
         await _poll_order(session, task, byoc=byoc, now=now)
         return
 
@@ -175,17 +178,10 @@ async def process_subscription_task(
     if quote is None:
         return
 
-    amount = (Decimal(quote.authorized_amount_minor) / 100).quantize(Decimal("0.01"))
-    if amount > spec.initial_amount:
-        _finish_failed(
-            session,
-            task,
-            f"报价 {amount} USD 超过套餐首充 {spec.initial_amount} USD",
-            now,
-        )
-        return
-
-    card = _claim_card(session, task, plan=spec.name, amount=amount, now=now)
+    # 上次尝试可能已经锁过卡（validate 超时/网络异常时会保留锁），优先复用
+    card = _reuse_own_card(session, task, spec=spec, now=now)
+    if card is None:
+        card = _claim_card(session, task, plan=spec.name, now=now)
     if card is None:
         enqueue_open_card(session, spec.name)
         _reschedule(session, task, STATUS_WAITING_CARD, now + timedelta(seconds=60), now)
@@ -234,6 +230,14 @@ async def process_open_card_task(
         task.next_run_at = now
         task.claimed_until = None
         task.last_error = None
+        crud.save_task(session, task)
+        return
+    if crud.find_usable_card(session, spec.name) is not None:
+        # 库存任务判定“有可用卡”，但订阅这边只是暂时抢不到卡锁；补卡任务到此为止
+        task.status = STATUS_SUCCEEDED
+        task.next_run_at = now
+        task.claimed_until = None
+        task.last_error = "已有可用卡，无需补卡"
         crud.save_task(session, task)
         return
     _reschedule(
@@ -302,8 +306,64 @@ def _read_payload(task: Task, settings: Settings) -> dict[str, Any]:
     return payload
 
 
-def _claim_card(session: Session, task: Task, *, plan: str, amount: Decimal, now: datetime):
-    candidates = crud.find_subscription_candidates(session, plan, amount, now)
+def _reuse_own_card(
+    session: Session,
+    task: Task,
+    *,
+    spec: PlanSpec,
+    now: datetime,
+):
+    """上一轮已经锁给自己的卡，校验超时/网络异常后下一轮继续用，不要重新选。"""
+    if not task.card_id:
+        return None
+    card = session.get(Card, task.card_id)
+    if card is None:
+        task.card_id = None
+        crud.save_task(session, task)
+        return None
+
+    expiry = parse_card_expiry(card.expiry)
+    usable = (
+        card.plan == spec.name
+        and card.apply_status == "SUCCESS"
+        and card.used_count < 3
+        and bool(card.card_no and card.expiry and card.cvv)
+        and expiry is not None
+        and not card_is_expired(expiry, now)
+    )
+    if not usable:
+        crud.release_card(session, card.id or 0, task.request_id)
+        task.card_id = None
+        crud.save_task(session, task)
+        return None
+
+    if card.reserved_task_id == task.request_id and (
+        card.reserved_until is None or card.reserved_until >= now
+    ):
+        crud.refresh_card_reservation(
+            session,
+            card.id or 0,
+            task.request_id,
+            until=now + timedelta(seconds=CARD_RESERVE_SECONDS),
+        )
+        return card
+
+    # 锁已过期：尝试重新抢，被别的任务拿走就放弃
+    if crud.claim_card(
+        session,
+        card.id or 0,
+        task.request_id,
+        until=now + timedelta(seconds=CARD_RESERVE_SECONDS),
+        now=now,
+    ):
+        return card
+    task.card_id = None
+    crud.save_task(session, task)
+    return None
+
+
+def _claim_card(session: Session, task: Task, *, plan: str, now: datetime):
+    candidates = crud.find_subscription_candidates(session, plan, now)
     for card in candidates:
         expiry = parse_card_expiry(card.expiry)
         if expiry is None or card_is_expired(expiry, now):
@@ -360,6 +420,8 @@ async def _submit_order(
     try:
         await byoc.validate_order(order)
     except PollTimeout as exc:
+        # validate 没建单，释放卡锁让别的任务先用，下一轮重新选卡
+        _release_card(session, task)
         _reschedule(
             session,
             task,
@@ -369,11 +431,16 @@ async def _submit_order(
             error=f"校验响应超时：{exc}"[:500],
         )
         return
+    except OrderValidationError as exc:
+        _finish_failed(session, task, str(exc), now)
+        _clear_payload(session, task)
+        return
     except APIError as exc:
         _finish_failed(session, task, f"BYOC 校验拒绝：HTTP {exc.status} {exc.message}", now)
         _clear_payload(session, task)
         return
     except httpx.HTTPError as exc:
+        _release_card(session, task)
         _reschedule(
             session,
             task,
