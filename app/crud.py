@@ -68,14 +68,21 @@ def get_card(session: Session, card_id: int) -> Card:
     return card
 
 
-def find_usable_card(session: Session, plan: str) -> Card | None:
-    """可用 = 已启用且次数没用完；余额只做记录，不参与判定。"""
-    stmt = (
-        select(Card)
-        .where(Card.plan == plan, Card.enabled.is_(True), Card.used_count < 3)
-        .order_by(col(Card.id))
+def find_usable_card(
+    session: Session,
+    plan: str,
+    *,
+    min_balance: Decimal | None = None,
+) -> Card | None:
+    """可用 = 已启用、次数没用完；传 min_balance 时要求余额不低于它。"""
+    stmt = select(Card).where(
+        Card.plan == plan,
+        Card.enabled.is_(True),
+        Card.used_count < 3,
     )
-    return session.exec(stmt).first()
+    if min_balance is not None:
+        stmt = stmt.where(Card.balance >= min_balance)
+    return session.exec(stmt.order_by(col(Card.id))).first()
 
 
 def get_recent_incomplete_card(session: Session, plan: str, since: datetime) -> Card | None:
@@ -298,6 +305,8 @@ def find_subscription_candidates(
     session: Session,
     plan: str,
     now: datetime,
+    *,
+    min_balance: Decimal | None = None,
 ) -> list[Card]:
     stmt = (
         select(Card)
@@ -312,6 +321,8 @@ def find_subscription_candidates(
         )
         .order_by(col(Card.id))
     )
+    if min_balance is not None:
+        stmt = stmt.where(Card.balance >= min_balance)
     return list(session.exec(stmt).all())
 
 

@@ -3,6 +3,7 @@
 import hashlib
 import json
 from datetime import timedelta
+from decimal import Decimal
 
 import httpx
 import pytest
@@ -501,3 +502,31 @@ async def test_quote_amount_is_not_validated(db_session):
     assert task.display_amount == "USD $9999.00"
     assert byoc.created and byoc.created[0]["quote_id"] == "gxq1.test"
     assert card.reserved_until is None
+
+
+async def test_card_balance_below_plan_unit_price_waits(db_session):
+    card = make_card(db_session, plan="plus", balance=Decimal("15.99"))
+    task = new_task(db_session)
+    byoc = FakeByoc()
+
+    await process_subscription_task(db_session, task, byoc=byoc, settings=make_settings())
+
+    db_session.refresh(task)
+    db_session.refresh(card)
+    assert task.status == "waiting_card"
+    assert byoc.created == []
+    assert crud.find_open_card_task(db_session, "plus") is not None
+    assert card.reserved_until is None
+
+
+async def test_card_balance_equal_to_plan_unit_price_is_used(db_session):
+    card = make_card(db_session, plan="plus", balance=Decimal("16.00"))
+    task = new_task(db_session)
+    byoc = FakeByoc()
+
+    await process_subscription_task(db_session, task, byoc=byoc, settings=make_settings())
+
+    db_session.refresh(task)
+    db_session.refresh(card)
+    assert task.status == "succeeded"
+    assert byoc.created[0]["card_number"] == card.card_no

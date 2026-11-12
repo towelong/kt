@@ -232,7 +232,7 @@ async def process_open_card_task(
         task.last_error = None
         crud.save_task(session, task)
         return
-    if crud.find_usable_card(session, spec.name) is not None:
+    if crud.find_usable_card(session, spec.name, min_balance=spec.unit_price) is not None:
         # 库存任务判定“有可用卡”，但订阅这边只是暂时抢不到卡锁；补卡任务到此为止
         task.status = STATUS_SUCCEEDED
         task.next_run_at = now
@@ -327,6 +327,7 @@ def _reuse_own_card(
         card.plan == spec.name
         and card.apply_status == "SUCCESS"
         and card.used_count < 3
+        and card.balance >= spec.unit_price
         and bool(card.card_no and card.expiry and card.cvv)
         and expiry is not None
         and not card_is_expired(expiry, now)
@@ -363,7 +364,8 @@ def _reuse_own_card(
 
 
 def _claim_card(session: Session, task: Task, *, plan: str, now: datetime):
-    candidates = crud.find_subscription_candidates(session, plan, now)
+    spec = PLAN_BY_NAME[plan]
+    candidates = crud.find_subscription_candidates(session, plan, now, min_balance=spec.unit_price)
     for card in candidates:
         expiry = parse_card_expiry(card.expiry)
         if expiry is None or card_is_expired(expiry, now):

@@ -54,12 +54,13 @@ def make_card(
 
 
 def add_usable_card(session, plan: str) -> Card:
+    spec = next(item for item in PLAN_SPECS if item.name == plan)
     return make_card(
         session,
         plan=plan,
         card_id=f"VC_{plan}",
         request_no=f"kaika_{plan}_seed0001",
-        balance=Decimal("1.00"),
+        balance=spec.initial_amount,
     )
 
 
@@ -193,10 +194,18 @@ def transaction_event(
 # --------------------------------------------------------------------------- 假的 VCC 客户端
 
 
-def us_bin(bin_id=1001, *, country="US", card_type="PREPAID", currency="USD", min_open="10.00"):
+def us_bin(
+    bin_id=1001,
+    *,
+    country="US",
+    card_type="PREPAID",
+    currency="USD",
+    min_open="10.00",
+    bin_number="537800",
+):
     return CardBin(
         bin_id=bin_id,
-        bin="486880",
+        bin=bin_number,
         card_org="VISA",
         card_type=card_type,
         currency=currency,

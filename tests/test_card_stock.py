@@ -233,3 +233,54 @@ async def test_used_up_card_is_replaced(db_session):
     assert report.missing == ["plus"]
     assert report.applied == ["plus"]
     assert len(client.applies) == 1
+
+
+async def test_us_bin_must_start_with_5378(db_session, caplog):
+    caplog.set_level(logging.ERROR, logger="app.services.card_stock")
+    client = FakeClient(usd="3000.00", bins=[us_bin(bin_number="486880")])
+
+    report = await replenish(db_session, client, now=utcnow())
+
+    assert client.applies == []
+    assert report.applied == []
+    assert "没有可用的美国卡 BIN" in caplog.text
+
+
+async def test_5378_bin_must_be_us(db_session, caplog):
+    caplog.set_level(logging.ERROR, logger="app.services.card_stock")
+    client = FakeClient(
+        usd="3000.00",
+        bins=[us_bin(bin_number="537800", country="SG")],
+    )
+
+    await replenish(db_session, client, now=utcnow())
+
+    assert client.applies == []
+    assert "没有可用的美国卡 BIN" in caplog.text
+
+
+async def test_5378_us_bin_is_selected(db_session):
+    client = FakeClient(
+        usd="3000.00",
+        bins=[
+            us_bin(bin_id=1, bin_number="486880"),
+            us_bin(bin_id=2, bin_number="537800"),
+        ],
+    )
+
+    await replenish(db_session, client, now=utcnow())
+
+    assert client.applies
+    assert all(request.card_bin_id == 2 for request in client.applies)
+
+
+async def test_low_balance_card_triggers_new_card(db_session):
+    card = add_usable_card(db_session, "plus")
+    card.balance = Decimal("1.00")
+    crud.save_card(db_session, card)
+    client = FakeClient(usd="3000.00")
+
+    report = await replenish(db_session, client, now=utcnow())
+
+    assert "plus" in report.applied
+    assert len(client.applies) >= 1

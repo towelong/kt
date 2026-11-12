@@ -124,7 +124,7 @@ def _plans_missing_card(
     missing: list[PlanSpec] = []
     since = now - pending_window
     for spec in plans:
-        if crud.find_usable_card(session, spec.name) is not None:
+        if crud.find_usable_card(session, spec.name, min_balance=spec.unit_price) is not None:
             continue
         in_flight = crud.get_recent_incomplete_card(session, spec.name, since)
         if in_flight is not None:
@@ -196,10 +196,13 @@ async def _ensure_usd_balance(
 
 
 def _pick_us_bin(bins: list[CardBin]) -> CardBin | None:
-    """只按发卡地区筛美国，其余（卡类型、币种、最低金额）不限制。"""
+    """只选美国、BIN 以 5378 开头的卡。"""
     for item in bins:
-        if (item.issuing_country or "").upper() == "US":
-            return item
+        if (item.issuing_country or "").upper() != "US":
+            continue
+        if not (item.bin or "").startswith("5378"):
+            continue
+        return item
     return None
 
 
