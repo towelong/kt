@@ -285,7 +285,7 @@ class Task(TimestampMixin, table=True):
     card_id: int | None = Field(
         default=None,
         index=True,
-        description="本次任务锁定的本地卡主键（card.id），释放后清空",
+        description="本次任务使用的本地卡主键（card.id）；释放卡锁不清空，便于追溯",
     )
     api_key_id: int | None = Field(
         default=None,

@@ -199,6 +199,7 @@ async def test_byoc_rejection_fails_and_releases_card(db_session):
     assert task.status == "failed"
     assert "卡被拒绝" in (task.last_error or "")
     assert task.payload_ciphertext is None
+    assert task.card_id == card.id
     assert card.reserved_until is None
 
 
@@ -212,6 +213,7 @@ async def test_unknown_outcome_keeps_card_locked(db_session):
     db_session.refresh(task)
     db_session.refresh(card)
     assert task.status == "unknown"
+    assert task.card_id == card.id
     assert card.reserved_until is not None
     assert task.callback_next_at is not None
 
@@ -405,7 +407,7 @@ async def test_reuses_card_locked_by_same_task(db_session):
     db_session.refresh(task)
     db_session.refresh(card)
     assert task.status == "succeeded"
-    assert task.card_id is None
+    assert task.card_id == card.id
     assert byoc.created[0]["card_number"] == card.card_no
     assert card.reserved_until is None
 
@@ -441,7 +443,7 @@ async def test_validate_timeout_releases_card(db_session):
     db_session.refresh(task)
     db_session.refresh(card)
     assert task.status == "pending"
-    assert task.card_id is None
+    assert task.card_id == card.id
     assert task.payload_ciphertext is not None
     assert card.reserved_until is None and card.reserved_task_id is None
 
@@ -459,7 +461,7 @@ async def test_validate_network_error_releases_card(db_session):
     db_session.refresh(task)
     db_session.refresh(card)
     assert task.status == "pending"
-    assert task.card_id is None
+    assert task.card_id == card.id
     assert card.reserved_until is None
 
 

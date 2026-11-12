@@ -612,9 +612,9 @@ def _finish_failed(session: Session, task: Task, error: str, now: datetime) -> N
 
 
 def _release_card(session: Session, task: Task) -> None:
+    """只释放卡锁，保留 task.card_id 作为“这单用了哪张卡”的追溯字段。"""
     if task.card_id:
         crud.release_card(session, task.card_id, task.request_id)
-        task.card_id = None
 
 
 def _clear_payload(session: Session, task: Task) -> None:
