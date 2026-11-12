@@ -163,6 +163,9 @@ def transaction_event(
     original="35.60",
     event_id="evt_tx_1",
     related="",
+    original_currency="USD",
+    actual_currency="USD",
+    remark=None,
 ):
     data = {
         "transactionId": transaction_id,
@@ -173,15 +176,17 @@ def transaction_event(
         "cardType": "PREPAID",
         "transactionType": "REFUND" if "REFUND" in status else "PURCHASE",
         "originalAmount": original,
-        "originalCurrency": "USD",
+        "originalCurrency": original_currency,
         "actualAmount": actual,
-        "actualCurrency": "USD",
+        "actualCurrency": actual_currency,
         "feeAmount": "0.53",
         "merchantName": "Google Ads",
         "merchantCountry": "US",
         "merchantMcc": "7311",
         "transactionTime": "2026-07-02 12:00:02",
     }
+    if remark is not None:
+        data["remark"] = remark
     return parse(make_body, event_id, f"CARD_TRANSACTION.{status}", "CARD_TRANSACTION", data)
 
 

@@ -198,6 +198,11 @@ class CardTransactionData(AiLinkModel):
     merchant_country: str | None = None
     merchant_mcc: str | None = None
     transaction_time: str | None = None
+    # 平台目前文档没有失败原因字段，这里兼容可能的下发
+    remark: str | None = None
+    fail_reason_code: str | None = None
+    fail_reason_text: str | None = None
+    reason: str | None = None
 
 
 class CardTransactionEvent(WebhookEvent):

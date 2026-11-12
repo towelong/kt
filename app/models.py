@@ -152,11 +152,21 @@ class CardTransaction(TimestampMixin, table=True):
         decimal_places=2,
         description="原始授权/交易金额（原币种）",
     )
+    original_currency: str | None = Field(
+        default=None,
+        max_length=8,
+        description="原始金额币种，平台字段 originalCurrency，例如 PHP、USD",
+    )
     actual_amount: Decimal = Field(
         default=Decimal("0.00"),
         max_digits=18,
         decimal_places=2,
         description="本阶段实际金额，已含手续费；清算扣款、退款加回都用它",
+    )
+    actual_currency: str | None = Field(
+        default=None,
+        max_length=8,
+        description="实际金额币种，平台字段 actualCurrency",
     )
     merchant_name: str | None = Field(default=None, max_length=255, description="商户名称")
     transaction_time: datetime | None = Field(
@@ -181,13 +191,18 @@ class CardTransaction(TimestampMixin, table=True):
         max_length=128,
         description="最近一次处理该交易的 webhook eventId，排查用",
     )
+    remark: str | None = Field(
+        default=None,
+        max_length=255,
+        description="流水备注：授权失败等业务文案，优先取平台返回，没有则本地生成",
+    )
     use_counted: bool = Field(
         default=False,
-        description="本交易是否已计入 used_count，保证同一交易只计一次",
+        description="本交易当前是否占用使用次数；按状态目标值做差值，重复推送不重复计",
     )
     balance_applied: bool = Field(
         default=False,
-        description="本交易是否已改变卡余额，保证清算/退款只记一次",
+        description="本交易当前是否已影响卡余额；阶段推进时只应用差额",
     )
 
 

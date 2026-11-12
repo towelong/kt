@@ -1,9 +1,12 @@
 """Webhook 事件落库：开卡补三要素、交易计数与余额。
 
-计数口径（每笔 transaction 只落一次）：
-- AUTH_SUCCESS +1；AUTH_FAILED -1；REFUND_SUCCESS / REVERSE_SUCCESS -1；不低于 0。
-- SETTLED 扣 actual_amount；退款/撤销加回 actual_amount。
-- 次数到 3 停用，退款把次数降回来会重新启用。
+计数与余额口径（同一 transaction 多次推送，按状态目标值做差值，重试不重复）：
+- PROCESSING：次数 +1，并按 actual_amount 扣卡余额（预先占用）；
+- AUTH_SUCCESS / SETTLED：只推进状态，次数和余额都不再变；
+- AUTH_FAILED：次数 -1，并退回 PROCESSING 已扣的金额；
+- REFUND_SUCCESS / REVERSE_SUCCESS（独立交易）：次数 -1，并加回 actual_amount；
+- CORRECTION：修正金额照常从余额扣除，不影响使用次数；
+- 次数到 3 自动停用，降回 3 以下会重新启用。
 """
 
 from __future__ import annotations
@@ -23,19 +26,23 @@ logger = logging.getLogger(__name__)
 
 MAX_USES = 3
 
-# 每笔交易对使用次数的增量；不在表里的状态不动次数
+# 状态变化时对使用次数的增量：PROCESSING 占一次，失败/退款回退一次。
+# AUTH_SUCCESS / SETTLED / CORRECTION 不再额外加；同一状态重复推送不重复应用。
 COUNT_DELTA: dict[str, int] = {
-    "AUTH_SUCCESS": 1,
+    "PROCESSING": 1,
     "AUTH_FAILED": -1,
     "REFUND_SUCCESS": -1,
     "REVERSE_SUCCESS": -1,
 }
 
-# 每笔交易对卡余额的增量（actual_amount 已含手续费，只加一次）
-BALANCE_DELTA: dict[str, int] = {
-    "SETTLED": -1,
+# 该交易对卡余额的目标累计金额符号：
+# PROCESSING 预先扣；AUTH_SUCCESS/SETTLED 不再扣；失败退回；修正继续扣。
+BALANCE_TARGET: dict[str, int] = {
+    "PROCESSING": -1,
+    "AUTH_FAILED": 0,
     "REFUND_SUCCESS": 1,
     "REVERSE_SUCCESS": 1,
+    "CORRECTION": -1,
 }
 
 _KNOWN_PLANS = {plan.value for plan in CardPlan}
@@ -207,12 +214,15 @@ def handle_card_transaction(session: Session, event: CardTransactionEvent) -> No
     status = (data.event_status or "").upper()
 
     transaction = crud.get_card_transaction(session, data.transaction_id)
+    is_new = transaction is None
     if transaction is None:
         transaction = CardTransaction(
             transaction_id=data.transaction_id,
             card_id=data.card_id or "",
-            event_status=status or "UNKNOWN",
+            event_status="UNKNOWN",
         )
+    prev_status = None if is_new else transaction.event_status
+    prev_actual = Decimal("0") if is_new else (transaction.actual_amount or Decimal("0"))
     transaction.event_id = event.event_id
     if data.card_id:
         transaction.card_id = data.card_id
@@ -222,8 +232,17 @@ def handle_card_transaction(session: Session, event: CardTransactionEvent) -> No
         transaction.original_amount = data.original_amount
     if data.actual_amount is not None:
         transaction.actual_amount = data.actual_amount
+    if data.original_currency:
+        transaction.original_currency = data.original_currency
+    if data.actual_currency:
+        transaction.actual_currency = data.actual_currency
     if data.merchant_name:
         transaction.merchant_name = data.merchant_name
+    platform_remark = data.remark or data.fail_reason_text or data.fail_reason_code or data.reason
+    if platform_remark:
+        transaction.remark = platform_remark[:255]
+    elif status == "AUTH_FAILED":
+        transaction.remark = "授权失败"
     if data.related_transaction_id:
         transaction.related_transaction_id = data.related_transaction_id
     parsed_time = parse_platform_time(data.transaction_time)
@@ -245,33 +264,47 @@ def handle_card_transaction(session: Session, event: CardTransactionEvent) -> No
         crud.save_card_transaction(session, transaction)
         return
 
-    if status in COUNT_DELTA and not transaction.use_counted:
+    if status != prev_status and status in COUNT_DELTA:
         delta = COUNT_DELTA[status]
         before = card.used_count
         card.used_count = max(0, before + delta)
-        transaction.use_counted = True
+        transaction.use_counted = delta > 0
         logger.info(
-            "卡使用次数变更 card=%s transaction=%s %+d：%d -> %d",
+            "卡使用次数变更 card=%s transaction=%s %s %+d：%d -> %d",
             card.card_id,
             transaction.transaction_id,
+            status,
             delta,
             before,
             card.used_count,
         )
 
-    if status in BALANCE_DELTA and not transaction.balance_applied:
-        amount = transaction.actual_amount or Decimal("0")
-        after = card.balance + amount * BALANCE_DELTA[status]
-        if after < 0:
-            logger.error(
-                "卡余额不足：card=%s balance=%s 本次扣减=%s transaction=%s",
+    if status in BALANCE_TARGET:
+        previous = BALANCE_TARGET.get(prev_status, 0) * prev_actual
+        target = BALANCE_TARGET[status] * (transaction.actual_amount or Decimal("0"))
+        delta = target - previous
+        if delta:
+            after = card.balance + delta
+            if after < 0:
+                logger.error(
+                    "卡余额不足：card=%s balance=%s 本次扣减=%s transaction=%s status=%s",
+                    card.card_id,
+                    card.balance,
+                    -delta,
+                    transaction.transaction_id,
+                    status,
+                )
+            card.balance = max(Decimal("0"), after)
+            logger.info(
+                "卡余额变更 card=%s transaction=%s %s %+.2f：%s -> %s",
                 card.card_id,
-                card.balance,
-                amount,
                 transaction.transaction_id,
+                status,
+                delta,
+                card.balance - delta,
+                card.balance,
             )
-        card.balance = max(Decimal("0"), after)
-        transaction.balance_applied = True
+        transaction.balance_applied = target != 0
 
     if status == "AUTH_FAILED":
         logger.error(

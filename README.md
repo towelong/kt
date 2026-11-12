@@ -123,7 +123,7 @@ class SettledToLedger(EventHandler[CardTransactionEvent]):
 - 缺卡时先查账户余额：USD 够直接开；不够按 `CARD_STOCK_USDT_USD_RATE`（默认 0.997）把缺口折成 USDT 兑换，兑换后重新查余额；两边都不够打 `error` 日志并跳过本轮。
 - 卡 BIN 只按发卡地区筛 `issuingCountry=US`，卡类型、币种、最低金额都不再额外限制；配额用尽时打 error。
 - 开卡前先写 `card` 占位行（`request_no` 唯一，含套餐名），超时后下一轮不会重复提交；三要素等开卡 Webhook 补齐后才 `enabled`。
-- 交易 Webhook 按 `transaction_id` 落 `card_transaction`：`AUTH_SUCCESS` +1、`AUTH_FAILED` -1、退款/撤销 -1（最低 0）；`SETTLED` 扣 `actual_amount`，退款/撤销加回。每个 transaction 只计一次，重复投递无害。
+- 交易 Webhook 按 `transaction_id` 落 `card_transaction`：`PROCESSING` 先 +1 并按 `actual_amount` 扣余额；`AUTH_SUCCESS` / `SETTLED` 只推进状态、次数和余额都不再变；`AUTH_FAILED` 次数 -1 并退回已扣金额；退款/撤销（独立交易）-1 并加回；`CORRECTION` 照常扣减修正金额、不计次数。同一交易多阶段按差值计算，重试和无序推送都不会重复计。
 - 次数到 3 自动停用，退款把次数降回来会重新启用。
 - 多副本部署靠 `job_lease` 抢锁，同一时间只有一个实例真正扫描。
 
