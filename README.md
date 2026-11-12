@@ -125,6 +125,7 @@ class SettledToLedger(EventHandler[CardTransactionEvent]):
 - 开卡前先写 `card` 占位行（`request_no` 唯一，含套餐名），超时后下一轮不会重复提交；三要素等开卡 Webhook 补齐后才 `enabled`。
 - 交易 Webhook 按 `transaction_id` 落 `card_transaction`：`PROCESSING` 先 +1 并按 `actual_amount` 扣余额；`AUTH_SUCCESS` / `SETTLED` 只推进状态、次数和余额都不再变；`AUTH_FAILED` 次数 -1 并退回已扣金额；退款/撤销（独立交易）-1 并加回；`CORRECTION` 照常扣减修正金额、不计次数。同一交易多阶段按差值计算，重试和无序推送都不会重复计。
 - 次数到 3 自动停用，退款把次数降回来会重新启用。
+- 卡操作事件落 `card_operation`：充值加余额、转出减余额，`eventId` 唯一约束保证重投不重复加钱；首充成功/失败同步更新 `initial_funding_status`。
 - 多副本部署靠 `job_lease` 抢锁，同一时间只有一个实例真正扫描。
 
 平台已有卡可以一次性同步进本地 `card` 表（按 `cardId` 幂等，不会重复插入）：

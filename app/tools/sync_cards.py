@@ -54,12 +54,12 @@ class SyncReport:
 
 
 def plan_from_remark(remark: str | None) -> str:
-    """平台没有我们的套餐字段，只能从备注里认；认不出就标 unknown。"""
+    """平台没有我们的套餐字段，只能从备注里认；认不出默认 plus。"""
     text = (remark or "").lower()
     for name in PLAN_BY_NAME:
         if name in text:
             return name
-    return "unknown"
+    return "plus"
 
 
 def parse_balance(value: Any) -> Decimal:
@@ -93,10 +93,8 @@ def _upsert_card(
             existing.balance = balance
             changed = True
         if existing.plan == "unknown":
-            inferred = plan_from_remark(item.get("remark"))
-            if inferred != "unknown":
-                existing.plan = inferred
-                changed = True
+            existing.plan = plan_from_remark(item.get("remark"))
+            changed = True
         batch_no = item.get("batchNo")
         if batch_no and existing.batch_no != batch_no:
             existing.batch_no = batch_no

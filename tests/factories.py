@@ -286,3 +286,38 @@ class FakeClient:
             initial_funding_status="PENDING",
             card_ids=[f"VC{index}"],
         )
+
+
+def operation_event(
+    make_body,
+    *,
+    event_type="CARD_OPERATION.RECHARGE_SUCCESS",
+    event_id="evt_op_1",
+    card_id="VC1",
+    amount="16.00",
+    currency="USD",
+    request_no="CR202611120001",
+    funding_purpose=None,
+    initial_funding_status=None,
+    card_issue_request_no=None,
+    operation_time="2026-11-12 12:00:00",
+):
+    operation_type = event_type.split(".", 1)[-1].split("_")[0]
+    data = {
+        "requestNo": request_no,
+        "operationType": operation_type,
+        "operationStatus": "SUCCESS",
+        "cardId": card_id,
+        "cardNoMask": "486532******1298",
+        "cardType": "PREPAID",
+        "amount": amount,
+        "currency": currency,
+        "operationTime": operation_time,
+    }
+    if funding_purpose:
+        data["fundingPurpose"] = funding_purpose
+    if initial_funding_status:
+        data["initialFundingStatus"] = initial_funding_status
+    if card_issue_request_no:
+        data["cardIssueRequestNo"] = card_issue_request_no
+    return parse(make_body, event_id, event_type, "CARD_OPERATION", data)

@@ -6,6 +6,7 @@ import logging
 
 from app.integrations.ailink.dispatch import EventContext, EventHandler, dispatcher
 from app.integrations.ailink.events import CardOperationEvent
+from app.services.card_events import handle_card_operation
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,11 @@ class CardOperationHandler(EventHandler[CardOperationEvent]):
     categories = ("CARD_OPERATION", "CARD")
 
     async def process(self, event: CardOperationEvent, ctx: EventContext) -> None:
+        if ctx.session_scope is None:
+            raise RuntimeError("分发器未注入 session_scope，卡操作事件无法落库")
+        with ctx.session_scope() as session:
+            handle_card_operation(session, event)
+
         data = event.data
         logger.info(
             "VCC 卡操作事件 type=%s requestNo=%s 操作=%s 状态=%s 卡=%s 金额=%s %s 退款=%s %s",

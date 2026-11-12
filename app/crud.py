@@ -7,7 +7,15 @@ from sqlalchemy import or_, update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, col, select
 
-from app.models import ApiKey, Card, CardTransaction, JobLease, Task, utcnow
+from app.models import (
+    ApiKey,
+    Card,
+    CardOperation,
+    CardTransaction,
+    JobLease,
+    Task,
+    utcnow,
+)
 
 DEFAULT_LIMIT = 20
 MAX_LIMIT = 100
@@ -399,3 +407,25 @@ def touch_api_key(session: Session, api_key: ApiKey) -> None:
     api_key.last_used_at = utcnow()
     session.add(api_key)
     session.commit()
+
+
+# ---------- CardOperation ----------
+
+
+def apply_card_operation(
+    session: Session,
+    operation: CardOperation,
+    card: Card | None = None,
+) -> bool:
+    """流水和余额在同一个事务里提交；eventId 冲突说明重复投递，回滚返回 False。"""
+    session.add(operation)
+    if card is not None:
+        card.updated_at = utcnow()
+        session.add(card)
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        return False
+    session.refresh(operation)
+    return True

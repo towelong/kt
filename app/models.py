@@ -356,3 +356,47 @@ class ApiKey(TimestampMixin, table=True):
     enabled: bool = Field(default=True, index=True, description="是否启用；吊销后置 false")
     expires_at: datetime | None = Field(default=None, description="过期时间（UTC），为空表示长期")
     last_used_at: datetime | None = Field(default=None, description="最后一次通过鉴权的时间（UTC）")
+
+
+class CardOperation(TimestampMixin, table=True):
+    """卡资金/状态操作事件流水：充值、转出、冻结、销卡等。
+
+    以平台 eventId 做唯一键，保证同一条 webhook 重投不会重复加/减余额。
+    """
+
+    __tablename__ = "card_operation"
+
+    id: int | None = Field(default=None, primary_key=True, description="自增主键")
+    event_id: str = Field(
+        max_length=128,
+        unique=True,
+        description="平台 webhook eventId；唯一约束用于幂等，重复投递直接跳过",
+    )
+    card_id: str = Field(max_length=64, index=True, description="平台业务卡 ID")
+    operation_type: str = Field(
+        max_length=32,
+        description=(
+            "操作类型：RECHARGE / WITHDRAW / FREEZE / UNFREEZE / "
+            "CANCEL / LIMIT_CHANGE / REMARK_UPDATE"
+        ),
+    )
+    operation_status: str = Field(max_length=16, description="操作状态，例如 SUCCESS / FAILED")
+    amount: Decimal = Field(
+        default=Decimal("0.00"),
+        max_digits=18,
+        decimal_places=2,
+        description="资金操作金额；非资金操作是 0",
+    )
+    currency: str | None = Field(default=None, max_length=8, description="金额币种")
+    request_no: str | None = Field(default=None, max_length=64, description="本次操作请求号")
+    funding_purpose: str | None = Field(
+        default=None,
+        max_length=32,
+        description="资金用途，首充为 INITIAL_FUNDING",
+    )
+    card_issue_request_no: str | None = Field(
+        default=None,
+        max_length=64,
+        description="首充事件里关联的原开卡请求号",
+    )
+    operation_time: datetime | None = Field(default=None, description="平台操作时间（按 UTC 存）")

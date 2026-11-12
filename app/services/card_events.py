@@ -19,8 +19,13 @@ from sqlmodel import Session
 
 from app import crud
 from app.integrations.ailink.errors import AiLinkDecryptError
-from app.integrations.ailink.events import CardIssueEvent, CardTransactionEvent, IssuedCard
-from app.models import Card, CardPlan, CardTransaction, utcnow
+from app.integrations.ailink.events import (
+    CardIssueEvent,
+    CardOperationEvent,
+    CardTransactionEvent,
+    IssuedCard,
+)
+from app.models import Card, CardOperation, CardPlan, CardTransaction, utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -49,11 +54,11 @@ _KNOWN_PLANS = {plan.value for plan in CardPlan}
 
 
 def parse_plan_from_request_no(request_no: str | None) -> str:
-    """requestNo 形如 kaika_plus_1730000000000ab12，开卡 webhook 用它回填套餐。"""
+    """requestNo 形如 kaika_plus_1730000000000ab12；认不出套餐时默认 plus。"""
     for part in (request_no or "").split("_"):
         if part in _KNOWN_PLANS:
             return part
-    return "unknown"
+    return "plus"
 
 
 def parse_platform_time(value: str | None) -> datetime | None:
@@ -318,3 +323,78 @@ def handle_card_transaction(session: Session, event: CardTransactionEvent) -> No
 
     card.enabled = card_is_ready(card)
     crud.save_card_transaction(session, transaction, card)
+
+
+# --------------------------------------------------------------------------- 卡操作事件
+
+# 资金操作对余额的方向；其他操作只记流水，不动余额
+OPERATION_BALANCE_EFFECT: dict[str, int] = {
+    "CARD_OPERATION.RECHARGE_SUCCESS": 1,
+    "CARD_OPERATION.WITHDRAW_SUCCESS": -1,
+}
+
+
+def handle_card_operation(session: Session, event: CardOperationEvent) -> None:
+    """充值/转出在同一个事务里写流水并更新余额，eventId 唯一保证重投幂等。"""
+    data = event.data
+    status = (data.operation_status or "").upper()
+    amount = data.amount or Decimal("0")
+    card = crud.get_card_by_platform_id(session, data.card_id) if data.card_id else None
+
+    if card is None:
+        logger.error(
+            "卡操作事件找不到本地卡 card=%s event=%s type=%s",
+            data.card_id,
+            event.event_id,
+            event.event_type,
+        )
+    else:
+        effect = OPERATION_BALANCE_EFFECT.get(event.event_type, 0)
+        if effect:
+            after = card.balance + amount * effect
+            if after < 0:
+                logger.error(
+                    "卡余额不足：card=%s balance=%s 操作=%s 金额=%s %s",
+                    card.card_id,
+                    card.balance,
+                    event.event_type,
+                    amount,
+                    data.currency,
+                )
+            card.balance = max(Decimal("0"), after)
+            logger.info(
+                "卡余额变更 card=%s event=%s %s %+.2f：%s -> %s",
+                card.card_id,
+                event.event_id,
+                event.event_type,
+                amount * effect,
+                card.balance - amount * effect,
+                card.balance,
+            )
+
+        if data.funding_purpose == "INITIAL_FUNDING":
+            if event.event_type == "CARD_OPERATION.RECHARGE_SUCCESS":
+                card.initial_funding_status = data.initial_funding_status or "SUCCESS"
+            elif event.event_type == "CARD_OPERATION.RECHARGE_FAILED":
+                card.initial_funding_status = "FAILED"
+                card.enabled = False
+                logger.error(
+                    "开卡首充失败 card=%s requestNo=%s",
+                    card.card_id,
+                    data.card_issue_request_no,
+                )
+
+    operation = CardOperation(
+        event_id=event.event_id,
+        card_id=data.card_id or "",
+        operation_type=data.operation_type or event.event_type.split(".", 1)[-1],
+        operation_status=status or "UNKNOWN",
+        amount=amount,
+        currency=data.currency,
+        request_no=data.request_no,
+        funding_purpose=data.funding_purpose,
+        card_issue_request_no=data.card_issue_request_no,
+        operation_time=parse_platform_time(data.operation_time),
+    )
+    if not crud.apply_card_operation(session, operation, card):
+        logger.info("卡操作事件重复投递，跳过：event=%s", event.event_id)

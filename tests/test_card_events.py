@@ -3,14 +3,22 @@
 import logging
 from decimal import Decimal
 
+from sqlmodel import select
+
 from app import crud
-from app.services.card_events import handle_card_issue, handle_card_transaction
+from app.models import CardOperation
+from app.services.card_events import (
+    handle_card_issue,
+    handle_card_operation,
+    handle_card_transaction,
+)
 from tests.factories import (
     CARD_NUMBER,
     REQUEST_NO,
     WEBHOOK_SECRET,
     issue_event,
     make_card,
+    operation_event,
     transaction_event,
 )
 
@@ -202,8 +210,8 @@ def test_parse_plan_from_request_no():
 
     assert parse_plan_from_request_no(REQUEST_NO) == "plus"
     assert parse_plan_from_request_no("kaika_pro100_1730000000000ab12") == "pro100"
-    assert parse_plan_from_request_no("manual_card") == "unknown"
-    assert parse_plan_from_request_no(None) == "unknown"
+    assert parse_plan_from_request_no("manual_card") == "plus"
+    assert parse_plan_from_request_no(None) == "plus"
 
 
 async def test_processing_deducts_balance_and_counts_use(db_session, make_body):
@@ -436,3 +444,55 @@ def test_auth_failed_decrements_one_use(db_session, make_body):
 
     db_session.refresh(card)
     assert card.used_count == 1
+
+
+def test_recharge_success_adds_balance_and_is_idempotent(db_session, make_body):
+    card = make_card(db_session, balance=Decimal("0.00"))
+    event = operation_event(make_body, amount="16.00", event_id="evt_recharge_1")
+
+    handle_card_operation(db_session, event)
+    handle_card_operation(db_session, event)
+
+    db_session.refresh(card)
+    assert card.balance == Decimal("16.00")
+    operations = db_session.exec(select(CardOperation)).all()
+    assert len(operations) == 1
+    assert operations[0].event_id == "evt_recharge_1"
+    assert operations[0].amount == Decimal("16.00")
+
+
+def test_withdraw_success_subtracts_balance(db_session, make_body):
+    card = make_card(db_session, balance=Decimal("20.00"))
+
+    handle_card_operation(
+        db_session,
+        operation_event(
+            make_body,
+            event_type="CARD_OPERATION.WITHDRAW_SUCCESS",
+            amount="5.00",
+            event_id="evt_withdraw_1",
+        ),
+    )
+
+    db_session.refresh(card)
+    assert card.balance == Decimal("15.00")
+
+
+def test_initial_funding_recharge_updates_status(db_session, make_body):
+    card = make_card(db_session, balance=Decimal("0.00"))
+
+    handle_card_operation(
+        db_session,
+        operation_event(
+            make_body,
+            amount="16.00",
+            event_id="evt_initial_funding",
+            funding_purpose="INITIAL_FUNDING",
+            initial_funding_status="SUCCESS",
+            card_issue_request_no=REQUEST_NO,
+        ),
+    )
+
+    db_session.refresh(card)
+    assert card.balance == Decimal("16.00")
+    assert card.initial_funding_status == "SUCCESS"

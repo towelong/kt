@@ -86,8 +86,8 @@ async def test_dry_run_does_not_write(db_session):
 def test_plan_from_remark():
     assert plan_from_remark("stock-plus") == "plus"
     assert plan_from_remark("PRO100 backup") == "pro100"
-    assert plan_from_remark("") == "unknown"
-    assert plan_from_remark(None) == "unknown"
+    assert plan_from_remark("") == "plus"
+    assert plan_from_remark(None) == "plus"
 
 
 def test_parse_balance():
