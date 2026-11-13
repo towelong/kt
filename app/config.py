@@ -48,6 +48,8 @@ class Settings(BaseSettings):
     card_stock_interval_seconds: int = 300
     # 占位卡在这段时间内没等到开卡 webhook，就先不重复开新卡
     card_stock_pending_minutes: int = 30
+    # 补卡任务重试上限：开卡要么开成、要么到次数置 failed，不能无限等
+    open_card_max_attempts: int = 5
     # USDT→USD 折算率：10 USDT 约到账 9.97 USD
     card_stock_usdt_usd_rate: float = 0.997
 
@@ -60,6 +62,10 @@ class Settings(BaseSettings):
     subscription_worker_enabled: bool = False
     subscription_worker_interval_seconds: int = 10
     subscription_callback_max_attempts: int = 5
+    # BYOC 失败一律保留 payload 重试（同 request_id），达到次数才置为失败
+    subscription_max_submit_attempts: int = 10
+    subscription_retry_backoff_seconds: int = 60
+    subscription_retry_max_backoff_seconds: int = 300
 
     # 平台限流：每个真实 HTTP 请求占一个配额，重试也占
     ailink_rate_limit_per_minute: int = 450

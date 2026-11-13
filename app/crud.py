@@ -37,13 +37,15 @@ def create_card_intent(
     *,
     plan: str,
     request_no: str,
-    recharge_amount: Decimal,
 ) -> Card:
-    """先落占位行再调申请卡：超时后能靠 request_no 认出“已提交过”，不重复开卡。"""
+    """先落占位行再调申请卡：超时后能靠 request_no 认出“已提交过”，不重复开卡。
+
+    余额从 0 开始：首充是独立异步流程，只认 CARD_OPERATION.RECHARGE_SUCCESS 的入账。
+    """
     card = Card(
         plan=plan,
         request_no=request_no,
-        balance=recharge_amount,
+        balance=Decimal("0.00"),
         apply_status="PENDING",
         enabled=False,
     )
@@ -53,12 +55,28 @@ def create_card_intent(
     return card
 
 
-def get_card_by_request_no(session: Session, request_no: str) -> Card | None:
-    return session.exec(select(Card).where(Card.request_no == request_no)).first()
+def get_card_by_request_no(
+    session: Session,
+    request_no: str,
+    *,
+    for_update: bool = False,
+) -> Card | None:
+    stmt = select(Card).where(Card.request_no == request_no)
+    if for_update:
+        stmt = stmt.with_for_update()
+    return session.exec(stmt).first()
 
 
-def get_card_by_platform_id(session: Session, card_id: str) -> Card | None:
-    return session.exec(select(Card).where(Card.card_id == card_id)).first()
+def get_card_by_platform_id(
+    session: Session,
+    card_id: str,
+    *,
+    for_update: bool = False,
+) -> Card | None:
+    stmt = select(Card).where(Card.card_id == card_id)
+    if for_update:
+        stmt = stmt.with_for_update()
+    return session.exec(stmt).first()
 
 
 def get_card(session: Session, card_id: int) -> Card:
@@ -86,9 +104,9 @@ def find_usable_card(
 
 
 def get_recent_incomplete_card(session: Session, plan: str, since: datetime) -> Card | None:
-    """近期提交、但还没变成可用卡（等 webhook 补三要素）的占位，避免重复开卡。
+    """近期提交、但还没变成可用卡（等三要素或首充）的占位，避免重复开卡。
 
-    次数用完被停用的卡不算“未完成”，它应该被下一轮补掉。
+    首充成功前卡是停用的，也算在途；次数用完被停用的卡不算，应该被下一轮补掉。
     """
     stmt = (
         select(Card)
@@ -96,7 +114,11 @@ def get_recent_incomplete_card(session: Session, plan: str, since: datetime) -> 
             Card.plan == plan,
             Card.enabled.is_(False),
             Card.created_at >= since,
-            or_(Card.apply_status == "PENDING", Card.card_no.is_(None)),
+            or_(
+                Card.apply_status == "PENDING",
+                Card.card_no.is_(None),
+                Card.initial_funding_status == "PENDING",
+            ),
         )
         .order_by(col(Card.id))
     )
@@ -120,8 +142,15 @@ def mark_card_failed(session: Session, card: Card) -> Card:
 # ---------- CardTransaction ----------
 
 
-def get_card_transaction(session: Session, transaction_id: str) -> CardTransaction | None:
+def get_card_transaction(
+    session: Session,
+    transaction_id: str,
+    *,
+    for_update: bool = False,
+) -> CardTransaction | None:
     stmt = select(CardTransaction).where(CardTransaction.transaction_id == transaction_id)
+    if for_update:
+        stmt = stmt.with_for_update()
     return session.exec(stmt).first()
 
 
@@ -271,12 +300,16 @@ def claim_next_task(session: Session, *, now: datetime, claim_until: datetime) -
 
 
 def find_open_card_task(session: Session, plan: str) -> Task | None:
+    """同一套餐只认一条在途补卡任务；processing 是等 webhook/重试中的补卡。
+
+    waiting_card 只为兼容升级前的旧数据，新代码不再给补卡任务写这个状态。
+    """
     stmt = (
         select(Task)
         .where(
             Task.kind == "open_card",
             Task.plan == plan,
-            Task.status.in_(("pending", "running", "waiting_card")),
+            Task.status.in_(("pending", "running", "processing", "waiting_card")),
         )
         .order_by(col(Task.id))
     )

@@ -188,7 +188,7 @@ async def test_expired_quote_requeues_without_locking_card(db_session):
     assert byoc.created == []
 
 
-async def test_byoc_rejection_fails_and_releases_card(db_session):
+async def test_byoc_rejection_keeps_payload_and_retries(db_session):
     card = make_card(db_session, plan="plus")
     task = new_task(db_session)
     byoc = FakeByoc(create_error=APIError(400, {"message": "卡被拒绝"}))
@@ -197,11 +197,40 @@ async def test_byoc_rejection_fails_and_releases_card(db_session):
 
     db_session.refresh(task)
     db_session.refresh(card)
-    assert task.status == "failed"
+    # 明确拒绝不等于终态：保留 session 密文，退避后再试同一请求号
+    assert task.status == "pending"
+    assert task.submit_attempts == 1
     assert "卡被拒绝" in (task.last_error or "")
-    assert task.payload_ciphertext is None
+    assert task.payload_ciphertext is not None
     assert task.card_id == card.id
     assert card.reserved_until is None
+    assert task.callback_next_at is None
+    assert task.next_run_at > utcnow()
+
+
+async def test_byoc_failure_fails_after_retry_limit(db_session):
+    card = make_card(db_session, plan="plus")
+    task = new_task(db_session)
+    settings = make_settings(subscription_max_submit_attempts=3)
+    byoc = FakeByoc(create_error=APIError(400, {"message": "卡被拒绝"}))
+
+    for attempt in range(1, 4):
+        task.next_run_at = utcnow() - timedelta(seconds=1)
+        crud.save_task(db_session, task)
+        await process_subscription_task(db_session, task, byoc=byoc, settings=settings)
+
+        db_session.refresh(task)
+        assert task.submit_attempts == attempt
+        if attempt < 3:
+            assert task.status == "pending"
+            assert task.payload_ciphertext is not None
+
+    db_session.refresh(card)
+    assert task.status == "failed"
+    assert "不再重试" in (task.last_error or "")
+    assert task.payload_ciphertext is None
+    assert card.reserved_until is None
+    assert task.callback_next_at is not None
 
 
 async def test_unknown_outcome_keeps_card_locked(db_session):
@@ -215,6 +244,7 @@ async def test_unknown_outcome_keeps_card_locked(db_session):
     db_session.refresh(card)
     assert task.status == "unknown"
     assert task.card_id == card.id
+    assert task.payload_ciphertext is None
     assert card.reserved_until is not None
     assert task.callback_next_at is not None
 
@@ -368,7 +398,7 @@ def test_every_plan_maps_to_byoc_plan_type(plan):
     assert spec.billing_country in {"ph", "eg"}
 
 
-async def test_validation_rejection_fails_without_charging(db_session):
+async def test_validation_rejection_retries_without_charging(db_session):
     card = make_card(db_session, plan="plus")
     task = new_task(db_session)
 
@@ -382,9 +412,10 @@ async def test_validation_rejection_fails_without_charging(db_session):
 
     db_session.refresh(task)
     db_session.refresh(card)
-    assert task.status == "failed"
+    assert task.status == "pending"
+    assert task.submit_attempts == 1
     assert "session 不合法" in (task.last_error or "")
-    assert task.payload_ciphertext is None
+    assert task.payload_ciphertext is not None
     assert card.reserved_until is None
 
 
@@ -413,7 +444,7 @@ async def test_reuses_card_locked_by_same_task(db_session):
     assert card.reserved_until is None
 
 
-async def test_validation_error_fails_with_reason(db_session):
+async def test_validation_error_keeps_reason_and_retries(db_session):
     card = make_card(db_session, plan="plus")
     task = new_task(db_session)
 
@@ -425,9 +456,10 @@ async def test_validation_error_fails_with_reason(db_session):
 
     db_session.refresh(task)
     db_session.refresh(card)
-    assert task.status == "failed"
+    assert task.status == "pending"
+    assert task.submit_attempts == 1
     assert "quote_bound=false" in (task.last_error or "")
-    assert task.payload_ciphertext is None
+    assert task.payload_ciphertext is not None
     assert card.reserved_until is None
 
 
@@ -444,6 +476,7 @@ async def test_validate_timeout_releases_card(db_session):
     db_session.refresh(task)
     db_session.refresh(card)
     assert task.status == "pending"
+    assert task.submit_attempts == 1
     assert task.card_id == card.id
     assert task.payload_ciphertext is not None
     assert card.reserved_until is None and card.reserved_task_id is None

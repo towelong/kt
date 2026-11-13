@@ -1,7 +1,7 @@
 """订阅任务：BYOC 报价 → 校验 → 下单，结果通过回调返回。
 
 设计约束：
-- session 只在任务 payload 密文里，提交给 BYOC 后立即清空；
+- session 只在任务 payload 密文里，建单成功或进入终态后清空（失败重试期间保留）；
 - 卡在结果确定前锁定，失败释放，未知保留等 recover；
 - 成功/失败只认 BYOC 的 order 状态，不靠 HTTP 201 猜。
 """
@@ -50,6 +50,7 @@ CALLBACK_HEADER = "Kt-Secret"
 CALLBACK_BACKOFF_SECONDS = (60, 300, 900, 3600, 10800)
 CARD_RESERVE_SECONDS = 600
 POLL_INTERVAL_SECONDS = 30
+OPEN_CARD_RETRY_SECONDS = 120
 
 
 def new_request_id(now: datetime | None = None) -> str:
@@ -174,7 +175,7 @@ async def process_subscription_task(
         _finish_failed(session, task, f"任务 payload 无法解密：{exc}", now)
         return
 
-    quote = await _quote(session, task, byoc=byoc, spec=spec, now=now)
+    quote = await _quote(session, task, byoc=byoc, spec=spec, settings=settings, now=now)
     if quote is None:
         return
 
@@ -195,7 +196,7 @@ async def process_subscription_task(
         _finish_failed(session, task, str(exc), now)
         return
 
-    await _submit_order(session, task, byoc=byoc, order=order, now=now)
+    await _submit_order(session, task, byoc=byoc, order=order, settings=settings, now=now)
 
 
 async def process_open_card_task(
@@ -206,17 +207,15 @@ async def process_open_card_task(
     settings: Settings,
     now: datetime | None = None,
 ) -> None:
+    """补卡任务：只有开成、重试、失败三种结局，不再借用订阅的 waiting_card。
+
+    开卡是异步的：同步响应经常没有 cardIds，三要素等 webhook 补，
+    所以“已受理”按 processing 轮询；重试达到 OPEN_CARD_MAX_ATTEMPTS 就置 failed。
+    """
     now = now or utcnow()
     spec = PLAN_BY_NAME.get(task.plan or "")
     if spec is None or ailink is None:
-        _reschedule(
-            session,
-            task,
-            STATUS_WAITING_CARD,
-            now + timedelta(seconds=120),
-            now,
-            error="补卡缺少套餐配置或 AiLink 客户端",
-        )
+        _finish_open_card_failed(session, task, "补卡缺少套餐配置或 AiLink 客户端", now)
         return
     report = await replenish(
         session,
@@ -226,28 +225,62 @@ async def process_open_card_task(
         now=now,
     )
     if report.applied:
-        task.status = STATUS_SUCCEEDED
-        task.next_run_at = now
-        task.claimed_until = None
-        task.last_error = None
-        crud.save_task(session, task)
+        _finish_open_card_succeeded(session, task, None, now)
         return
     if crud.find_usable_card(session, spec.name, min_balance=spec.unit_price) is not None:
         # 库存任务判定“有可用卡”，但订阅这边只是暂时抢不到卡锁；补卡任务到此为止
-        task.status = STATUS_SUCCEEDED
-        task.next_run_at = now
-        task.claimed_until = None
-        task.last_error = "已有可用卡，无需补卡"
-        crud.save_task(session, task)
+        _finish_open_card_succeeded(session, task, "已有可用卡，无需补卡", now)
+        return
+
+    reason = report.failure_reasons.get(spec.name) or "本轮没有补到卡"
+    task.submit_attempts += 1
+    limit = max(1, settings.open_card_max_attempts)
+    if task.submit_attempts >= limit:
+        _finish_open_card_failed(
+            session,
+            task,
+            f"{reason}（已尝试 {task.submit_attempts} 次，不再补卡）",
+            now,
+        )
         return
     _reschedule(
         session,
         task,
-        STATUS_WAITING_CARD,
-        now + timedelta(seconds=120),
+        STATUS_PROCESSING,
+        now + timedelta(seconds=OPEN_CARD_RETRY_SECONDS),
         now,
-        error="本轮没有补到卡，稍后重试",
+        error=reason[:500],
     )
+    logger.warning(
+        "补卡未完成，稍后重试 task=%s plan=%s 第 %d/%d 次：%s",
+        task.id,
+        spec.name,
+        task.submit_attempts,
+        limit,
+        reason,
+    )
+
+
+def _finish_open_card_succeeded(
+    session: Session,
+    task: Task,
+    note: str | None,
+    now: datetime,
+) -> None:
+    task.status = STATUS_SUCCEEDED
+    task.next_run_at = now
+    task.claimed_until = None
+    task.last_error = note
+    crud.save_task(session, task)
+
+
+def _finish_open_card_failed(session: Session, task: Task, reason: str, now: datetime) -> None:
+    task.status = STATUS_FAILED
+    task.last_error = reason[:500]
+    task.next_run_at = now
+    task.claimed_until = None
+    crud.save_task(session, task)
+    logger.error("补卡任务失败 task=%s plan=%s：%s", task.id, task.plan, reason)
 
 
 async def _quote(
@@ -256,20 +289,21 @@ async def _quote(
     *,
     byoc: ByocClient,
     spec: PlanSpec,
+    settings: Settings,
     now: datetime,
 ):
     try:
         quote = await byoc.quote(spec.byoc_plan_type, spec.billing_country)
     except (APIError, PollTimeout, httpx.HTTPError) as exc:
-        _reschedule(
+        _retry_or_fail(
             session,
             task,
-            STATUS_WAITING_QUOTE,
-            now + timedelta(seconds=60),
-            now,
-            error=f"获取报价失败：{exc}"[:500],
+            settings,
+            f"获取报价失败：{exc}",
+            now=now,
+            status=STATUS_WAITING_QUOTE,
+            delay_seconds=60,
         )
-        logger.error("订阅任务取报价失败 task=%s plan=%s：%s", task.id, spec.name, exc)
         return None
     if quote.valid_until <= now:
         _reschedule(
@@ -282,7 +316,15 @@ async def _quote(
         )
         return None
     if quote.plan_type.lower() != spec.byoc_plan_type:
-        _finish_failed(session, task, f"报价套餐不匹配：{quote.plan_type}", now)
+        _retry_or_fail(
+            session,
+            task,
+            settings,
+            f"报价套餐不匹配：{quote.plan_type}",
+            now=now,
+            status=STATUS_WAITING_QUOTE,
+            delay_seconds=60,
+        )
         return None
     task.quote_id = quote.quote_id
     task.authorized_amount_minor = quote.authorized_amount_minor
@@ -416,69 +458,79 @@ async def _submit_order(
     *,
     byoc: ByocClient,
     order: dict[str, Any],
+    settings: Settings,
     now: datetime,
 ) -> None:
     # 校验阶段没有建单，失败/超时都能安全重试，session 也还要留着
     try:
         await byoc.validate_order(order)
     except PollTimeout as exc:
-        # validate 没建单，释放卡锁让别的任务先用，下一轮重新选卡
-        _release_card(session, task)
-        _reschedule(
+        _retry_or_fail(
             session,
             task,
-            STATUS_PENDING,
-            now + timedelta(seconds=POLL_INTERVAL_SECONDS),
-            now,
-            error=f"校验响应超时：{exc}"[:500],
+            settings,
+            f"校验响应超时：{exc}",
+            now=now,
+            delay_seconds=POLL_INTERVAL_SECONDS,
         )
         return
     except OrderValidationError as exc:
-        _finish_failed(session, task, str(exc), now)
-        _clear_payload(session, task)
+        _retry_or_fail(session, task, settings, str(exc), now=now)
         return
     except APIError as exc:
-        _finish_failed(session, task, f"BYOC 校验拒绝：HTTP {exc.status} {exc.message}", now)
-        _clear_payload(session, task)
-        return
-    except httpx.HTTPError as exc:
-        _release_card(session, task)
-        _reschedule(
+        _retry_or_fail(
             session,
             task,
-            STATUS_PENDING,
-            now + timedelta(seconds=POLL_INTERVAL_SECONDS),
-            now,
-            error=f"校验网络异常：{type(exc).__name__}",
+            settings,
+            f"BYOC 校验拒绝：HTTP {exc.status} {exc.message}",
+            now=now,
+        )
+        return
+    except httpx.HTTPError as exc:
+        _retry_or_fail(
+            session,
+            task,
+            settings,
+            f"校验网络异常：{type(exc).__name__}",
+            now=now,
         )
         return
 
     # 一旦发出建单请求就不再重提：只按原 request_id 找回，session 也不再需要
     result: dict[str, Any] | None = None
+    submitted = False
     try:
         result = await byoc.create("/orders", order)
+        submitted = True
     except OutcomeUnknown as exc:
+        submitted = True
         _mark_unknown(session, task, f"下单结果待确认：{exc}", now)
     except APIError as exc:
         if exc.recovered_task_id:
+            submitted = True
             try:
                 result = await byoc.status(exc.recovered_task_id)
             except (APIError, PollTimeout, httpx.HTTPError):
                 _mark_unknown(session, task, "冲突后找回订单失败", now)
         else:
-            _finish_failed(
+            # 明确拒绝说明没有建单，保留 payload 稍后重试
+            _retry_or_fail(
                 session,
                 task,
+                settings,
                 f"BYOC 拒绝下单：HTTP {exc.status} {exc.message}",
-                now,
+                now=now,
             )
     except httpx.HTTPError as exc:
+        submitted = True
         _mark_unknown(session, task, f"网络异常：{type(exc).__name__}", now)
     except Exception as exc:
+        submitted = True
         _mark_unknown(session, task, f"下单异常：{type(exc).__name__}", now)
-    finally:
-        _clear_payload(session, task)
 
+    if submitted:
+        # 订单已经进了 BYOC，后面只按订单号/原请求号查询，session 密文不再需要
+        _clear_payload(session, task)
     if result is not None:
         _apply_order_state(session, task, result, now)
 
@@ -586,6 +638,55 @@ def _mark_unknown(session: Session, task: Task, reason: str, now: datetime) -> N
     logger.error("订阅任务结果未知，保留卡锁：task=%s reason=%s", task.id, reason)
 
 
+def _retry_or_fail(
+    session: Session,
+    task: Task,
+    settings: Settings,
+    reason: str,
+    *,
+    now: datetime,
+    status: str = STATUS_PENDING,
+    delay_seconds: int | None = None,
+) -> None:
+    """BYOC 失败统一入口：保留 payload 按次数退避重试，达到上限才置为失败。
+
+    计数只统计“和 BYOC 打交道失败”，和 Task.attempts（认领次数）分开，
+    否则轮询订单也会把重试预算吃掉。
+    """
+    task.submit_attempts += 1
+    message = reason[:500]
+    limit = max(1, settings.subscription_max_submit_attempts)
+    if task.submit_attempts >= limit:
+        _finish_failed(
+            session,
+            task,
+            f"{message}（已提交 {task.submit_attempts} 次，不再重试）",
+            now,
+        )
+        return
+
+    delay = (
+        delay_seconds if delay_seconds is not None else _retry_delay(task.submit_attempts, settings)
+    )
+    _release_card(session, task)
+    _reschedule(session, task, status, now + timedelta(seconds=delay), now, error=message)
+    logger.warning(
+        "BYOC 失败，保留 payload 稍后重试 task=%s plan=%s 第 %d/%d 次 %ss 后：%s",
+        task.id,
+        task.plan,
+        task.submit_attempts,
+        limit,
+        delay,
+        message,
+    )
+
+
+def _retry_delay(attempt: int, settings: Settings) -> int:
+    base = max(1, settings.subscription_retry_backoff_seconds)
+    ceiling = max(base, settings.subscription_retry_max_backoff_seconds)
+    return min(base * 2 ** max(0, attempt - 1), ceiling)
+
+
 def _reschedule(
     session: Session,
     task: Task,
@@ -607,6 +708,8 @@ def _finish_failed(session: Session, task: Task, error: str, now: datetime) -> N
     task.last_error = error[:500]
     task.next_run_at = now
     task.claimed_until = None
+    # 终态不再需要 session 密文，失败和成功一样在这里清掉
+    task.payload_ciphertext = None
     _release_card(session, task)
     _schedule_callback(session, task, now)
     logger.error("订阅任务失败 task=%s：%s", task.id, error)

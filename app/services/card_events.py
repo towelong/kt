@@ -1,11 +1,14 @@
 """Webhook 事件落库：开卡补三要素、交易计数与余额。
 
+余额与首充口径：开卡时余额为 0；首充是独立异步流程，只由
+CARD_OPERATION.RECHARGE_SUCCESS 入账，成功前卡不启用。
+
 计数与余额口径（同一 transaction 多次推送，按状态目标值做差值，重试不重复）：
 - PROCESSING：次数 +1，并按 actual_amount 扣卡余额（预先占用）；
 - AUTH_SUCCESS / SETTLED：只推进状态，次数和余额都不再变；
 - AUTH_FAILED：次数 -1，并退回 PROCESSING 已扣的金额；
 - REFUND_SUCCESS / REVERSE_SUCCESS（独立交易）：次数 -1，并加回 actual_amount；
-- CORRECTION：修正金额照常从余额扣除，不影响使用次数；
+- CORRECTION：修正金额按负数继续扣，不影响使用次数；
 - 次数到 3 自动停用，降回 3 以下会重新启用。
 """
 
@@ -136,15 +139,16 @@ def _upsert_issued_card(
     card.card_id = issued.card_id
     card.batch_no = data.batch_no or card.batch_no
     card.apply_status = "SUCCESS"
-    if data.initial_funding_status:
+    # 首充是独立异步流程：issue 事件不记余额，只记录状态；已经有 SUCCESS（充值先到）就不回退
+    if data.initial_funding_status and card.initial_funding_status != "SUCCESS":
         card.initial_funding_status = data.initial_funding_status
+    if card.initial_funding_status is None:
+        card.initial_funding_status = "PENDING"
     card.applied_at = (
         parse_platform_time(data.complete_time)
         or parse_platform_time(issued.created_at)
         or utcnow()
     )
-    if card.balance <= 0 and data.initial_funding_pending_amount is not None:
-        card.balance = Decimal(data.initial_funding_pending_amount)
 
     _apply_card_secrets(card, issued, webhook_secret)
 
@@ -156,16 +160,18 @@ def _upsert_issued_card(
         )
         card.enabled = False
     else:
-        card.enabled = card_is_ready(card)
+        # 首充成功前不启用，余额只等 CARD_OPERATION.RECHARGE_SUCCESS 入账
+        card.enabled = card_is_ready(card) and card.initial_funding_status == "SUCCESS"
 
     crud.save_card(session, card)
     logger.info(
-        "开卡事件已落库 card=%s plan=%s 启用=%s 次数=%d 余额=%s",
+        "开卡事件已落库 card=%s plan=%s 启用=%s 次数=%d 余额=%s 首充=%s",
         card.card_id,
         card.plan,
         card.enabled,
         card.used_count,
         card.balance,
+        card.initial_funding_status,
     )
 
 
@@ -255,7 +261,9 @@ def handle_card_transaction(session: Session, event: CardTransactionEvent) -> No
         transaction.transaction_time = parsed_time
 
     card = (
-        crud.get_card_by_platform_id(session, transaction.card_id) if transaction.card_id else None
+        crud.get_card_by_platform_id(session, transaction.card_id, for_update=True)
+        if transaction.card_id
+        else None
     )
     if card is None:
         logger.error(
@@ -339,7 +347,20 @@ def handle_card_operation(session: Session, event: CardOperationEvent) -> None:
     data = event.data
     status = (data.operation_status or "").upper()
     amount = data.amount or Decimal("0")
-    card = crud.get_card_by_platform_id(session, data.card_id) if data.card_id else None
+    card = (
+        crud.get_card_by_platform_id(session, data.card_id, for_update=True)
+        if data.card_id
+        else None
+    )
+    if card is None and data.card_issue_request_no:
+        # 首充可能比开卡 webhook 先到：占位行还没有 card_id，用开卡请求号认领
+        card = crud.get_card_by_request_no(
+            session,
+            data.card_issue_request_no,
+            for_update=True,
+        )
+        if card is not None and card.card_id is None and data.card_id:
+            card.card_id = data.card_id
 
     if card is None:
         logger.error(
@@ -375,6 +396,8 @@ def handle_card_operation(session: Session, event: CardOperationEvent) -> None:
         if data.funding_purpose == "INITIAL_FUNDING":
             if event.event_type == "CARD_OPERATION.RECHARGE_SUCCESS":
                 card.initial_funding_status = data.initial_funding_status or "SUCCESS"
+                # 首充到账才启用；三要素还没补齐的话 card_is_ready 仍是 False
+                card.enabled = card_is_ready(card)
             elif event.event_type == "CARD_OPERATION.RECHARGE_FAILED":
                 card.initial_funding_status = "FAILED"
                 card.enabled = False

@@ -122,10 +122,10 @@ class SettledToLedger(EventHandler[CardTransactionEvent]):
 - 可用卡 = `enabled`、`used_count < 3`，且余额不低于该套餐单价（plus 16 / pro100 90 / pro200 150 / pro500 470），不够就补新卡。
 - 缺卡时先查账户余额：USD 够直接开；不够按 `CARD_STOCK_USDT_USD_RATE`（默认 0.997）把缺口折成 USDT 兑换，兑换后重新查余额；两边都不够打 `error` 日志并跳过本轮。
 - 卡 BIN 只选 `issuingCountry=US` 且 BIN 以 `5378` 开头的配置；配额用尽或没有匹配 BIN 时打 error。
-- 开卡前先写 `card` 占位行（`request_no` 唯一，含套餐名），超时后下一轮不会重复提交；三要素等开卡 Webhook 补齐后才 `enabled`。
-- 交易 Webhook 按 `transaction_id` 落 `card_transaction`：`PROCESSING` 先 +1 并按 `actual_amount` 扣余额；`AUTH_SUCCESS` / `SETTLED` 只推进状态、次数和余额都不再变；`AUTH_FAILED` 次数 -1 并退回已扣金额；退款/撤销（独立交易）-1 并加回；`CORRECTION` 照常扣减修正金额、不计次数。同一交易多阶段按差值计算，重试和无序推送都不会重复计。
+- 开卡前先写 `card` 占位行（`request_no` 唯一，含套餐名），余额为 0，超时后下一轮不会重复提交；三要素等开卡 Webhook 补齐、首充 `CARD_OPERATION.RECHARGE_SUCCESS` 到账后才 `enabled`。
+- 交易 Webhook 按 `transaction_id` 落 `card_transaction`：`PROCESSING` 先 +1 并 `balance -= actual_amount`（持有卡行锁，多副本串行）；`AUTH_SUCCESS` / `SETTLED` 只推进状态、次数和余额都不再变；`AUTH_FAILED` 次数 -1 并退回已扣金额；退款/撤销（独立交易）-1 并加回；`CORRECTION` 按负数继续扣、不计次数。同一交易多阶段按差值计算，重投不重复计。
 - 次数到 3 自动停用，退款把次数降回来会重新启用。
-- 卡操作事件落 `card_operation`：充值加余额、转出减余额，`eventId` 唯一约束保证重投不重复加钱；首充成功/失败同步更新 `initial_funding_status`。
+- 卡操作事件落 `card_operation`：充值加余额、转出减余额，`eventId` 唯一约束保证重投不重复加钱；首充成功入账后启用，失败则停用。
 - 多副本部署靠 `job_lease` 抢锁，同一时间只有一个实例真正扫描。
 
 平台已有卡可以一次性同步进本地 `card` 表（按 `cardId` 幂等，不会重复插入）：
@@ -181,11 +181,11 @@ worker（`app/jobs/task_worker.py`）执行顺序：
 
 1. 抢任务（条件 UPDATE，多副本只跑一次）。
 2. 按内部套餐选卡并锁定：`enabled`、`used_count < 3`、三要素齐全、未过期、未被别的任务锁住，且卡余额不低于套餐单价；余额不够就投递补卡任务。
-3. 没有卡 → `waiting_card` 并投递 `open_card` 任务，补卡后再试。
+3. 没有卡 → 订阅任务 `waiting_card` 并投递 `open_card` 任务；补卡任务自身用 `processing` 等 webhook/重试，最多 `OPEN_CARD_MAX_ATTEMPTS` 次，之后置 `failed` 并带原因。
 4. `GET /quotes/{byoc_plan_type}?billing_country=...` 取 `quote_id`，过期就重新报价；金额和币种原样保存供回调/对账，不参与校验。
 5. 组单 → `POST /orders/validate` → `POST /orders`，同一个 `request_id`、同一份 JSON。
 6. 只认 BYOC 的订单状态：`completed + PAID` 成功，`failed/cancelled` 失败，`requires_action` 等 3DS；超时按原 `request_id` 找回，不换号重提。
-7. validate 超时/网络异常释放卡锁、任务 30 秒后重试；建单后结果未知保留卡锁等 `recover` 核对，成功/失败释放；终态清空 session 密文并回调。
+7. 取报价、validate、建单被 BYOC 打回（超时、网络异常、明确拒绝）一律保留 payload 重试：`submit_attempts` 累加，退避 60s 起、300s 封顶，达到 `SUBSCRIPTION_MAX_SUBMIT_ATTEMPTS` 才置为 `failed` 并回调。建单后结果未知保留卡锁等 `recover` 核对，成功/失败释放；建单成功或进入终态时清空 session 密文。
 
 套餐映射（BYOC 的名字和内部不一样）：
 
@@ -355,6 +355,7 @@ uv run python -m app.tools.api_keys revoke --prefix kt_a1b2c3d4
 | `CARD_STOCK_INTERVAL_SECONDS` | `300` | 扫描间隔 |
 | `CARD_STOCK_PENDING_MINUTES` | `30` | 有未完成开卡申请时，这段时间内不重复开卡 |
 | `CARD_STOCK_USDT_USD_RATE` | `0.997` | USDT→USD 折算率，10 USDT 约 9.97 USD |
+| `OPEN_CARD_MAX_ATTEMPTS` | `5` | 补卡任务最多尝试几次，超过置 `failed` |
 | `BYOC_BASE_URL` | `https://wangbohui.com` | BYOC 站点地址，只接受 HTTPS |
 | `BYOC_API_KEY` | 空 | BYOC API Key，放在 `X-API-Key` |
 | `BYOC_CALLBACK_SECRET` | 空 | 回调签名密钥，拼在 `k=v&...` 后面做 MD5 |
@@ -362,5 +363,8 @@ uv run python -m app.tools.api_keys revoke --prefix kt_a1b2c3d4
 | `SUBSCRIPTION_WORKER_ENABLED` | `false` | 是否启动订阅任务 worker |
 | `SUBSCRIPTION_WORKER_INTERVAL_SECONDS` | `10` | worker 轮询间隔 |
 | `SUBSCRIPTION_CALLBACK_MAX_ATTEMPTS` | `5` | 回调最多尝试几次，超过后放弃 |
+| `SUBSCRIPTION_MAX_SUBMIT_ATTEMPTS` | `10` | BYOC 取报价/校验/建单失败最多重试几次（同 `request_id`），超过才置为失败 |
+| `SUBSCRIPTION_RETRY_BACKOFF_SECONDS` | `60` | 失败重试的首次退避秒数，之后翻倍 |
+| `SUBSCRIPTION_RETRY_MAX_BACKOFF_SECONDS` | `300` | 失败重试的退避上限秒数 |
 | `AILINK_RATE_LIMIT_PER_MINUTE` | `450` | AiLink 每分钟请求上限；重试和只读 429 重试也占配额 |
 | `BYOC_RATE_LIMIT_PER_MINUTE` | `300` | BYOC 每分钟请求上限；create 重试、recover 也占配额 |

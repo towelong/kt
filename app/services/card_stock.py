@@ -66,6 +66,13 @@ class StockReport:
     converted_usdt: Decimal = Decimal("0")
     applied: list[str] = field(default_factory=list)
     failed: list[str] = field(default_factory=list)
+    # 失败原因按套餐记录，补卡任务直接写进 task.last_error，不再只有一句“没补到卡”
+    failure_reasons: dict[str, str] = field(default_factory=dict)
+
+
+def _record_failure(report: StockReport, spec: PlanSpec, reason: str) -> None:
+    report.failed.append(spec.name)
+    report.failure_reasons[spec.name] = reason
 
 
 async def replenish(
@@ -89,6 +96,8 @@ async def replenish(
 
     total = sum((spec.initial_amount for spec in missing), Decimal("0"))
     if not await _ensure_usd_balance(client, total, usdt_rate, report):
+        for spec in missing:
+            _record_failure(report, spec, "账户余额不足，无法开卡")
         return report
 
     bins = await client.list_card_bins()
@@ -98,6 +107,11 @@ async def replenish(
             bins.quota.issued_card_count,
             bins.quota.max_card_count,
         )
+        reason = (
+            f"开卡配额已用尽（已开 {bins.quota.issued_card_count}/{bins.quota.max_card_count}）"
+        )
+        for spec in missing:
+            _record_failure(report, spec, reason)
         return report
 
     for spec in missing:
@@ -108,7 +122,7 @@ async def replenish(
                 spec.name,
                 spec.initial_amount,
             )
-            report.failed.append(spec.name)
+            _record_failure(report, spec, f"没有可用的美国 BIN（首充需 {spec.initial_amount} USD）")
             continue
         await _issue_one(session, client, spec, bin_config, report)
 
@@ -218,7 +232,6 @@ async def _issue_one(
         session,
         plan=spec.name,
         request_no=request_no,
-        recharge_amount=spec.initial_amount,
     )
     payload = CardApplyRequest(
         request_no=request_no,
@@ -233,7 +246,7 @@ async def _issue_one(
     except AiLinkBusinessError as exc:
         logger.error("开卡被平台拒绝 plan=%s requestNo=%s：%s", spec.name, request_no, exc)
         crud.mark_card_failed(session, card)
-        report.failed.append(spec.name)
+        _record_failure(report, spec, f"开卡被平台拒绝：{exc}")
         return
     except (AiLinkTransportError, AiLinkServerError) as exc:
         logger.error(
@@ -242,12 +255,12 @@ async def _issue_one(
             request_no,
             exc,
         )
-        report.failed.append(spec.name)
+        _record_failure(report, spec, f"开卡结果未知，等待平台核对：{type(exc).__name__}")
         return
     except AiLinkError as exc:
         logger.error("开卡失败 plan=%s requestNo=%s：%s", spec.name, request_no, exc)
         crud.mark_card_failed(session, card)
-        report.failed.append(spec.name)
+        _record_failure(report, spec, f"开卡失败：{exc}")
         return
 
     if result.apply_status == "FAILED" or result.task_status == "FAILED":
@@ -259,7 +272,11 @@ async def _issue_one(
             result.task_status,
         )
         crud.mark_card_failed(session, card)
-        report.failed.append(spec.name)
+        _record_failure(
+            report,
+            spec,
+            f"开卡任务失败：applyStatus={result.apply_status} taskStatus={result.task_status}",
+        )
         return
 
     if not result.card_ids:
@@ -274,7 +291,7 @@ async def _issue_one(
         card.initial_funding_status = result.initial_funding_status
         card.batch_no = result.batch_no
         crud.save_card(session, card)
-        report.failed.append(spec.name)
+        _record_failure(report, spec, "开卡已受理，等待 webhook 补卡")
         return
 
     card.card_id = result.card_ids[0]
@@ -292,6 +309,8 @@ async def _issue_one(
             request_no,
             card.card_id,
         )
+        _record_failure(report, spec, "开卡成功但首充失败，卡不可用")
+        return
     logger.info(
         "开卡申请成功 plan=%s requestNo=%s card=%s applyStatus=%s 首充=%s",
         spec.name,
@@ -316,7 +335,6 @@ def _save_extra_card(
         session,
         plan=spec.name,
         request_no=extra_request_no,
-        recharge_amount=spec.initial_amount,
     )
     extra.card_id = card_id
     extra.apply_status = "SUCCESS"

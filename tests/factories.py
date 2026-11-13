@@ -41,8 +41,9 @@ def make_card(
         session,
         plan=plan,
         request_no=request_no,
-        recharge_amount=balance,
     )
+    card.balance = balance
+    card.initial_funding_status = "SUCCESS"
     card.card_id = card_id
     card.card_no = card_no
     card.expiry = "12/29"
@@ -226,12 +227,16 @@ class FakeClient:
         bins=None,
         quota_remaining=100,
         apply_status="SUCCESS",
+        initial_funding_status="PENDING",
+        deliver_immediately=True,
     ):
         self.usd = Decimal(usd)
         self.usdt = Decimal(usdt)
         self.bins = [us_bin()] if bins is None else bins
         self.quota_remaining = quota_remaining
         self.apply_status = apply_status
+        self.initial_funding_status = initial_funding_status
+        self.deliver_immediately = deliver_immediately
         self.calls: list[str] = []
         self.conversions: list[Decimal] = []
         self.applies: list = []
@@ -292,8 +297,8 @@ class FakeClient:
             batch_no=f"BATCH{index}",
             request_no=request.request_no,
             apply_status=self.apply_status,
-            initial_funding_status="PENDING",
-            card_ids=[f"VC{index}"],
+            initial_funding_status=self.initial_funding_status,
+            card_ids=[f"VC{index}"] if self.deliver_immediately else [],
         )
 
 

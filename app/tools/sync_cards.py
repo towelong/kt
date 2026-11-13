@@ -120,7 +120,6 @@ def _upsert_card(
             session,
             plan=plan,
             request_no=request_no,
-            recharge_amount=balance,
         )
     except (IntegrityError, crud.ConflictError):
         session.rollback()
@@ -132,6 +131,7 @@ def _upsert_card(
     card.batch_no = item.get("batchNo") or None
     card.apply_status = APPLY_STATUS_MAP.get(platform_status, "SUCCESS")
     card.applied_at = parse_platform_time(item.get("createTime"))
+    card.balance = balance
     # 列表没有完整卡号/CVV，导入的卡不参与自动订阅选卡
     card.enabled = False
     crud.save_card(session, card)

@@ -28,7 +28,6 @@ def test_issue_success_fills_secrets_and_enables(db_session, make_body, encrypt_
         db_session,
         plan="plus",
         request_no=REQUEST_NO,
-        recharge_amount=Decimal("48.00"),
     )
     event = issue_event(make_body, encrypt_field)
 
@@ -41,9 +40,61 @@ def test_issue_success_fills_secrets_and_enables(db_session, make_body, encrypt_
     assert card.cvv == "123"
     assert card.apply_status == "SUCCESS"
     assert card.initial_funding_status == "PENDING"
-    assert card.enabled is True
-    assert card.balance == Decimal("48.00")
+    # 开卡本身不记余额，首充成功前也不启用
+    assert card.enabled is False
+    assert card.balance == Decimal("0.00")
     assert card.applied_at is not None
+
+    handle_card_operation(
+        db_session,
+        operation_event(
+            make_body,
+            amount="48.00",
+            event_id="evt_initial_funding",
+            funding_purpose="INITIAL_FUNDING",
+            initial_funding_status="SUCCESS",
+            card_issue_request_no=REQUEST_NO,
+        ),
+    )
+
+    db_session.refresh(card)
+    assert card.balance == Decimal("48.00")
+    assert card.initial_funding_status == "SUCCESS"
+    assert card.enabled is True
+
+
+def test_initial_funding_before_issue_credits_placeholder(db_session, make_body, encrypt_field):
+    """首充比开卡 webhook 先到：用 cardIssueRequestNo 认领占位行，余额不丢。"""
+    card = crud.create_card_intent(db_session, plan="plus", request_no=REQUEST_NO)
+
+    handle_card_operation(
+        db_session,
+        operation_event(
+            make_body,
+            amount="48.00",
+            event_id="evt_funding_first",
+            funding_purpose="INITIAL_FUNDING",
+            initial_funding_status="SUCCESS",
+            card_issue_request_no=REQUEST_NO,
+        ),
+    )
+
+    db_session.refresh(card)
+    assert card.card_id == "VC1"
+    assert card.balance == Decimal("48.00")
+    assert card.initial_funding_status == "SUCCESS"
+    assert card.enabled is False
+
+    handle_card_issue(
+        db_session,
+        issue_event(make_body, encrypt_field),
+        webhook_secret=WEBHOOK_SECRET,
+    )
+
+    db_session.refresh(card)
+    assert card.balance == Decimal("48.00")
+    assert card.initial_funding_status == "SUCCESS"
+    assert card.enabled is True
 
 
 def test_issue_creates_row_when_placeholder_missing(db_session, make_body, encrypt_field):
@@ -52,6 +103,7 @@ def test_issue_creates_row_when_placeholder_missing(db_session, make_body, encry
         encrypt_field,
         request_no="kaika_pro500_1730000000000cd34",
         card_id="VC9",
+        initial_funding="SUCCESS",
     )
 
     handle_card_issue(db_session, event, webhook_secret=WEBHOOK_SECRET)
@@ -60,6 +112,7 @@ def test_issue_creates_row_when_placeholder_missing(db_session, make_body, encry
     assert card is not None
     assert card.plan == "pro500"
     assert card.enabled is True
+    assert card.balance == Decimal("0.00")
 
 
 def test_issue_without_webhook_secret_stays_disabled(db_session, make_body, encrypt_field):
@@ -67,7 +120,6 @@ def test_issue_without_webhook_secret_stays_disabled(db_session, make_body, encr
         db_session,
         plan="plus",
         request_no=REQUEST_NO,
-        recharge_amount=Decimal("48.00"),
     )
 
     handle_card_issue(db_session, issue_event(make_body, encrypt_field), webhook_secret=None)
@@ -82,7 +134,6 @@ def test_issue_failed_marks_card_failed(db_session, make_body, encrypt_field):
         db_session,
         plan="plus",
         request_no=REQUEST_NO,
-        recharge_amount=Decimal("48.00"),
     )
 
     handle_card_issue(

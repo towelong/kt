@@ -21,6 +21,7 @@ from app.models import utcnow
 from app.services.subscriptions import (
     KIND_OPEN_CARD,
     KIND_SUBSCRIPTION,
+    STATUS_FAILED,
     deliver_callback,
     process_open_card_task,
     process_subscription_task,
@@ -62,9 +63,10 @@ async def run_once(
                     )
                 elif task.kind == KIND_SUBSCRIPTION:
                     if byoc is None:
-                        task.status = "waiting_card"
+                        # 配置缺失不是“等卡”，重试也不会自己好，直接失败并留原因
+                        task.status = STATUS_FAILED
                         task.last_error = "未配置 BYOC，无法执行订阅任务"
-                        task.next_run_at = now + timedelta(seconds=ERROR_RETRY_SECONDS)
+                        task.next_run_at = now
                         task.claimed_until = None
                         crud.save_task(session, task)
                         continue

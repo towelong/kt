@@ -93,7 +93,7 @@ class Card(TimestampMixin, table=True):
         default=Decimal("0.00"),
         max_digits=18,
         decimal_places=2,
-        description="本地记账余额（USD）：开卡写入首充，清算扣、退款加；只做记录",
+        description="本地记账余额（USD）：开卡为 0，首充/充值成功加；PROCESSING 扣、失败退",
     )
     applied_at: datetime | None = Field(
         default=None,
@@ -107,7 +107,7 @@ class Card(TimestampMixin, table=True):
     enabled: bool = Field(
         default=False,
         index=True,
-        description="是否可用于交易；三要素齐全且次数没用完才为 true",
+        description="是否可用于交易；首充成功、三要素齐全且次数没用完才为 true",
     )
     apply_status: str = Field(
         default="PENDING",
@@ -222,7 +222,8 @@ class JobLease(SQLModel, table=True):
 class Task(TimestampMixin, table=True):
     """数据库任务队列：开卡和订阅下单共用，worker 用条件 UPDATE 抢占。
 
-    session 只以 AES-GCM 密文存在 payload_ciphertext 里，订单提交后立即清空。
+    session 只以 AES-GCM 密文存在 payload_ciphertext 里，建单成功或进入终态时清空；
+    提交失败（取报价/校验/建单）保留密文，按 submit_attempts 退避重试。
     """
 
     __tablename__ = "task"
@@ -268,11 +269,19 @@ class Task(TimestampMixin, table=True):
         max_length=24,
         index=True,
         description=(
-            "任务状态：pending / waiting_card / waiting_quote / processing / "
-            "waiting_action / succeeded / failed / unknown"
+            "任务状态：pending / processing / waiting_card / waiting_quote / "
+            "waiting_action / succeeded / failed / unknown；"
+            "waiting_card 只属于订阅任务等卡，补卡任务用 processing 等 webhook/重试"
         ),
     )
     attempts: int = Field(default=0, ge=0, description="已认领执行次数，排查重试风暴用")
+    submit_attempts: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "失败重试次数：BYOC 取报价/校验/建单失败、补卡未完成都累加；达到各自上限才置为失败"
+        ),
+    )
     next_run_at: datetime = Field(
         default_factory=utcnow,
         index=True,

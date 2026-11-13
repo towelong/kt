@@ -8,7 +8,7 @@ from sqlmodel import select
 
 from app import crud
 from app.models import Card, utcnow
-from app.services.card_events import handle_card_issue
+from app.services.card_events import handle_card_issue, handle_card_operation
 from app.services.card_stock import PLAN_SPECS, replenish
 from tests.factories import (
     REQUEST_NO,
@@ -17,6 +17,7 @@ from tests.factories import (
     add_usable_card,
     cover_all_plans,
     issue_event,
+    operation_event,
     us_bin,
 )
 
@@ -87,7 +88,6 @@ async def test_recent_incomplete_card_blocks_duplicate_issue(db_session, caplog)
         db_session,
         plan="plus",
         request_no="kaika_plus_recent0001",
-        recharge_amount=Decimal("48.00"),
     )
     client = FakeClient(usd="3000.00")
 
@@ -202,12 +202,22 @@ async def test_webhook_issued_card_is_usable(db_session, make_body, encrypt_fiel
         db_session,
         plan="plus",
         request_no=REQUEST_NO,
-        recharge_amount=Decimal("48.00"),
     )
     handle_card_issue(
         db_session,
         issue_event(make_body, encrypt_field),
         webhook_secret=WEBHOOK_SECRET,
+    )
+    handle_card_operation(
+        db_session,
+        operation_event(
+            make_body,
+            amount="48.00",
+            event_id="evt_funding_plus",
+            funding_purpose="INITIAL_FUNDING",
+            initial_funding_status="SUCCESS",
+            card_issue_request_no=REQUEST_NO,
+        ),
     )
 
     client = FakeClient(usd="3000.00")

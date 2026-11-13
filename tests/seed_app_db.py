@@ -10,7 +10,6 @@ from __future__ import annotations
 import base64
 import json
 import os
-from decimal import Decimal
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from sqlmodel import select
@@ -21,7 +20,11 @@ from app.db import session_scope
 from app.integrations.ailink.crypto import derive_sensitive_key
 from app.integrations.ailink.webhooks import parse_event
 from app.models import Card, CardTransaction
-from app.services.card_events import handle_card_issue, handle_card_transaction
+from app.services.card_events import (
+    handle_card_issue,
+    handle_card_operation,
+    handle_card_transaction,
+)
 from app.services.card_stock import PLAN_SPECS
 
 DEMO_SECRET = "demo_webhook_secret"
@@ -192,8 +195,7 @@ def _issue_event(plan: str, request_no: str, card_id: str, amount: str, applied_
         "applyStatus": "SUCCESS",
         "fundStatus": "CONFIRMED",
         "deliveryMode": "POOL_IMMEDIATE",
-        "initialFundingStatus": "SUCCESS",
-        "initialFundingPendingAmount": float(amount),
+        "initialFundingStatus": "PENDING",
         "cardIds": [card_id],
         "totalCount": 1,
         "successCount": 1,
@@ -205,6 +207,31 @@ def _issue_event(plan: str, request_no: str, card_id: str, amount: str, applied_
     }
     return parse_event(
         _event_body(f"evt_demo_issue_{plan}", "CARD_ISSUE.SUCCESS", "CARD_ISSUE", data)
+    )
+
+
+def _funding_event(plan: str, request_no: str, card_id: str, amount: str):
+    data = {
+        "requestNo": f"CR_{plan.upper()}_DEMO",
+        "cardIssueRequestNo": request_no,
+        "fundingPurpose": "INITIAL_FUNDING",
+        "initialFundingStatus": "SUCCESS",
+        "operationType": "RECHARGE",
+        "operationStatus": "SUCCESS",
+        "cardId": card_id,
+        "cardNoMask": "486532******1298",
+        "cardType": "PREPAID",
+        "amount": amount,
+        "currency": "USD",
+        "operationTime": "2026-11-01 10:02:00",
+    }
+    return parse_event(
+        _event_body(
+            f"evt_demo_funding_{plan}",
+            "CARD_OPERATION.RECHARGE_SUCCESS",
+            "CARD_OPERATION",
+            data,
+        )
     )
 
 
@@ -263,12 +290,15 @@ def seed() -> None:
                 session,
                 plan=plan,
                 request_no=request_no,
-                recharge_amount=Decimal(amount),
             )
             handle_card_issue(
                 session,
                 _issue_event(plan, request_no, card_id, amount, applied_at),
                 webhook_secret=DEMO_SECRET,
+            )
+            handle_card_operation(
+                session,
+                _funding_event(plan, request_no, card_id, amount),
             )
             print(f"已开卡 {plan} card_id={card_id} 首充={amount}")
 
