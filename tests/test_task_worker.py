@@ -1,5 +1,6 @@
 """任务 worker：认领、订阅执行、补卡任务、回调重试。"""
 
+import logging
 from datetime import timedelta
 
 import httpx
@@ -336,3 +337,57 @@ def test_running_task_with_active_claim_is_not_reclaimed(db_session):
     crud.save_task(db_session, task)
 
     assert crud.claim_next_task(db_session, now=now, claim_until=now + timedelta(minutes=5)) is None
+
+
+async def test_run_once_logs_task_start_and_finish(db_session, session_factory, caplog):
+    make_card(db_session, plan="plus")
+    task = new_task(db_session)
+    http, _ = callback_client()
+
+    with caplog.at_level(logging.INFO, logger="app.jobs.task_worker"):
+        await run_once(
+            session_factory=session_factory,
+            settings=make_settings(),
+            byoc=FakeByoc(),
+            ailink=None,
+            callback_http=http,
+            now=utcnow(),
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "任务开始 task=" in message and "kind=open_subscription" in message for message in messages
+    )
+    assert any(
+        f"任务结束 task={task.id}" in message and "status=succeeded" in message
+        for message in messages
+    )
+    await http.aclose()
+
+
+def test_task_status_counts_and_running_tasks(db_session):
+    before = crud.task_status_counts(db_session)
+    now = utcnow()
+    pending = crud.create_task(
+        db_session,
+        kind="open_card",
+        plan="plus",
+        request_id="order-202611121300000001",
+    )
+    running = crud.create_task(
+        db_session,
+        kind="open_card",
+        plan="plus",
+        request_id="order-202611121300000002",
+    )
+    running.status = "running"
+    running.claimed_until = now + timedelta(minutes=5)
+    crud.save_task(db_session, running)
+
+    counts = crud.task_status_counts(db_session)
+    assert counts.get("pending", 0) == before.get("pending", 0) + 1
+    assert counts.get("running", 0) == before.get("running", 0) + 1
+
+    ids = {task.id for task in crud.list_running_tasks(db_session, now=now)}
+    assert running.id in ids
+    assert pending.id not in ids

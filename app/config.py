@@ -28,6 +28,10 @@ class Settings(BaseSettings):
 
     api_prefix: str = "/api"
     cors_origins: list[str] = []
+    # 日志格式由 app/log_config.py 统一配置，这里只控制级别
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    # 任务队列快照间隔（秒），0 表示只在任务开始/结束时打日志
+    task_status_log_seconds: int = 60
     # 启动时自动执行 alembic upgrade head。默认关闭，开发环境在 .env 里打开；
     # 生产/多副本一律在发布流程里单独跑迁移
     auto_migrate: bool = False

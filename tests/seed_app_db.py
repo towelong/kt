@@ -339,4 +339,7 @@ def seed() -> None:
 
 
 if __name__ == "__main__":
+    from app.log_config import configure_logging
+
+    configure_logging()
     seed()

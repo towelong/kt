@@ -147,7 +147,7 @@ def test_issue_failed_marks_card_failed(db_session, make_body, encrypt_field):
     assert card.enabled is False
 
 
-def test_auth_success_without_processing_does_not_count(db_session, make_body):
+def test_auth_success_first_deducts_once(db_session, make_body):
     card = make_card(db_session)
 
     handle_card_transaction(db_session, transaction_event(make_body))
@@ -157,16 +157,17 @@ def test_auth_success_without_processing_does_not_count(db_session, make_body):
     )
 
     db_session.refresh(card)
-    assert card.used_count == 0
-    assert card.balance == Decimal("48.00")
+    assert card.used_count == 1
+    assert card.balance == Decimal("48.00") - Decimal("36.13")
     transaction = crud.get_card_transaction(db_session, "txn_1")
     assert transaction is not None
-    assert transaction.use_counted is False
-    assert transaction.balance_applied is False
+    assert transaction.use_counted is True
+    assert transaction.balance_applied is True
+    assert transaction.applied_amount == Decimal("36.13")
     assert transaction.event_status == "AUTH_SUCCESS"
 
 
-async def test_settled_does_not_deduct_again(db_session, make_body):
+async def test_settled_first_deducts_once(db_session, make_body):
     card = make_card(db_session)
 
     handle_card_transaction(db_session, transaction_event(make_body, status="SETTLED"))
@@ -176,17 +177,27 @@ async def test_settled_does_not_deduct_again(db_session, make_body):
     )
 
     db_session.refresh(card)
-    # 余额在 PROCESSING 已经扣过，SETTLED 只推进状态
-    assert card.balance == Decimal("48.00")
-    assert card.used_count == 0
+    assert card.balance == Decimal("48.00") - Decimal("36.13")
+    assert card.used_count == 1
     transaction = crud.get_card_transaction(db_session, "txn_1")
     assert transaction is not None
-    assert transaction.balance_applied is False
+    assert transaction.balance_applied is True
+    assert transaction.applied_amount == Decimal("36.13")
 
 
 def test_refund_decrements_count_and_returns_balance(db_session, make_body):
     card = make_card(db_session, used_count=2, balance=Decimal("20.00"))
 
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_1",
+            status="AUTH_SUCCESS",
+            actual="10.00",
+            event_id="evt_charge",
+        ),
+    )
     handle_card_transaction(
         db_session,
         transaction_event(
@@ -200,8 +211,8 @@ def test_refund_decrements_count_and_returns_balance(db_session, make_body):
     )
 
     db_session.refresh(card)
-    assert card.used_count == 1
-    assert card.balance == Decimal("30.00")
+    assert card.used_count == 2
+    assert card.balance == Decimal("20.00")
     assert card.enabled is True
 
 
@@ -369,6 +380,17 @@ async def test_processing_then_auth_failed_refunds_and_releases_use(db_session, 
             event_id="evt_fail_2",
         ),
     )
+    # 失败事件重投不能把已退回的钱再加一次
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_fail",
+            status="AUTH_FAILED",
+            actual="0.00",
+            event_id="evt_fail_3",
+        ),
+    )
 
     db_session.refresh(card)
     assert card.used_count == 0
@@ -393,6 +415,263 @@ async def test_processing_retry_does_not_double(db_session, make_body):
     db_session.refresh(card)
     assert card.used_count == 1
     assert card.balance == Decimal("48.00") - Decimal("15.63")
+
+
+async def test_auth_success_then_processing_keeps_first_amount(db_session, make_body):
+    card = make_card(db_session, balance=Decimal("48.00"))
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_reverse",
+            status="AUTH_SUCCESS",
+            actual="15.63",
+            event_id="evt_reverse_1",
+        ),
+    )
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_reverse",
+            status="PROCESSING",
+            actual="16.00",
+            event_id="evt_reverse_2",
+        ),
+    )
+
+    db_session.refresh(card)
+    assert card.used_count == 1
+    assert card.balance == Decimal("48.00") - Decimal("15.63")
+    transaction = crud.get_card_transaction(db_session, "txn_reverse")
+    assert transaction is not None
+    assert transaction.event_status == "AUTH_SUCCESS"
+
+
+async def test_settled_then_processing_does_not_regress_status(db_session, make_body):
+    card = make_card(db_session, balance=Decimal("48.00"))
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_rank",
+            status="SETTLED",
+            actual="15.63",
+            event_id="evt_rank_1",
+        ),
+    )
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_rank",
+            status="PROCESSING",
+            actual="15.63",
+            event_id="evt_rank_2",
+        ),
+    )
+
+    db_session.refresh(card)
+    assert card.used_count == 1
+    assert card.balance == Decimal("48.00") - Decimal("15.63")
+    transaction = crud.get_card_transaction(db_session, "txn_rank")
+    assert transaction is not None
+    assert transaction.event_status == "SETTLED"
+
+
+async def test_zero_amount_processing_waits_for_auth_success(db_session, make_body):
+    card = make_card(db_session, balance=Decimal("48.00"))
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_zero",
+            status="PROCESSING",
+            actual="0.00",
+            event_id="evt_zero_1",
+        ),
+    )
+    db_session.refresh(card)
+    assert card.used_count == 0
+    assert card.balance == Decimal("48.00")
+
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_zero",
+            status="AUTH_SUCCESS",
+            actual="15.63",
+            event_id="evt_zero_2",
+        ),
+    )
+
+    db_session.refresh(card)
+    assert card.used_count == 1
+    assert card.balance == Decimal("48.00") - Decimal("15.63")
+
+
+async def test_auth_failed_first_blocks_later_charge(db_session, make_body):
+    card = make_card(db_session, balance=Decimal("48.00"))
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_dead",
+            status="AUTH_FAILED",
+            actual="0.00",
+            event_id="evt_dead_1",
+        ),
+    )
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_dead",
+            status="AUTH_SUCCESS",
+            actual="15.63",
+            event_id="evt_dead_2",
+        ),
+    )
+
+    db_session.refresh(card)
+    assert card.used_count == 0
+    assert card.balance == Decimal("48.00")
+    transaction = crud.get_card_transaction(db_session, "txn_dead")
+    assert transaction is not None
+    assert transaction.event_status == "AUTH_FAILED"
+    assert transaction.balance_applied is False
+
+
+async def test_auth_failed_refunds_applied_amount_not_latest_actual(db_session, make_body):
+    card = make_card(db_session, balance=Decimal("48.00"))
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_revert",
+            status="PROCESSING",
+            actual="15.63",
+            event_id="evt_revert_1",
+        ),
+    )
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_revert",
+            status="AUTH_SUCCESS",
+            actual="16.00",
+            event_id="evt_revert_2",
+        ),
+    )
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_revert",
+            status="AUTH_FAILED",
+            actual="0.00",
+            event_id="evt_revert_3",
+        ),
+    )
+
+    db_session.refresh(card)
+    assert card.used_count == 0
+    assert card.balance == Decimal("48.00")
+    transaction = crud.get_card_transaction(db_session, "txn_revert")
+    assert transaction is not None
+    assert transaction.applied_amount == Decimal("0.00")
+    assert transaction.balance_applied is False
+
+
+async def test_refund_before_charge_applies_when_charge_arrives(db_session, make_body):
+    card = make_card(db_session, balance=Decimal("48.00"))
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_refund_early",
+            status="REFUND_SUCCESS",
+            actual="10.00",
+            related="txn_ordered",
+            event_id="evt_refund_early",
+        ),
+    )
+    db_session.refresh(card)
+    assert card.balance == Decimal("48.00")
+    assert card.used_count == 0
+
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_ordered",
+            status="AUTH_SUCCESS",
+            actual="15.63",
+            event_id="evt_ordered",
+        ),
+    )
+
+    db_session.refresh(card)
+    assert card.used_count == 0
+    assert card.balance == Decimal("48.00") - Decimal("15.63") + Decimal("10.00")
+    refund = crud.get_card_transaction(db_session, "txn_refund_early")
+    assert refund is not None
+    assert refund.balance_applied is True
+    assert refund.applied_amount == Decimal("10.00")
+
+
+async def test_refund_duplicate_does_not_credit_twice(db_session, make_body):
+    card = make_card(db_session, balance=Decimal("48.00"))
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_dup_charge",
+            status="AUTH_SUCCESS",
+            actual="15.63",
+            event_id="evt_dup_charge",
+        ),
+    )
+    for event_id in ("evt_dup_refund_1", "evt_dup_refund_2"):
+        handle_card_transaction(
+            db_session,
+            transaction_event(
+                make_body,
+                transaction_id="txn_dup_refund",
+                status="REFUND_SUCCESS",
+                actual="5.00",
+                related="txn_dup_charge",
+                event_id=event_id,
+            ),
+        )
+
+    db_session.refresh(card)
+    assert card.used_count == 0
+    assert card.balance == Decimal("48.00") - Decimal("15.63") + Decimal("5.00")
+
+
+async def test_refund_without_applied_original_does_not_credit(db_session, make_body):
+    card = make_card(db_session, balance=Decimal("48.00"))
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_orphan_refund",
+            status="REFUND_SUCCESS",
+            actual="10.00",
+            related="txn_missing",
+            event_id="evt_orphan_refund",
+        ),
+    )
+
+    db_session.refresh(card)
+    assert card.used_count == 0
+    assert card.balance == Decimal("48.00")
+    refund = crud.get_card_transaction(db_session, "txn_orphan_refund")
+    assert refund is not None
+    assert refund.balance_applied is False
 
 
 async def test_transaction_currencies_are_stored(db_session, make_body):
@@ -479,7 +758,7 @@ async def test_correction_deducts_without_counting_use(db_session, make_body):
     assert card.balance == Decimal("48.00") - Decimal("1.20")
 
 
-def test_auth_failed_decrements_one_use(db_session, make_body):
+def test_auth_failed_without_charge_does_not_decrement(db_session, make_body):
     card = make_card(db_session, used_count=2)
 
     handle_card_transaction(
@@ -494,7 +773,8 @@ def test_auth_failed_decrements_one_use(db_session, make_body):
     )
 
     db_session.refresh(card)
-    assert card.used_count == 1
+    assert card.used_count == 2
+    assert card.balance == Decimal("48.00")
 
 
 def test_recharge_success_adds_balance_and_is_idempotent(db_session, make_body):

@@ -158,6 +158,19 @@ async def process_subscription_task(
     now: datetime | None = None,
 ) -> None:
     now = now or utcnow()
+    logger.info(
+        "订阅任务执行 task=%s request=%s plan=%s status=%s attempts=%d "
+        "submit_attempts=%d card=%s byoc=%s payload=%s",
+        task.id,
+        task.request_id,
+        task.plan,
+        task.status,
+        task.attempts,
+        task.submit_attempts,
+        task.card_id,
+        task.byoc_task_id,
+        bool(task.payload_ciphertext),
+    )
     spec = PLAN_BY_NAME.get(task.plan or "")
     if spec is None:
         _finish_failed(session, task, f"未知套餐：{task.plan}", now)
@@ -213,6 +226,14 @@ async def process_open_card_task(
     所以“已受理”按 processing 轮询；重试达到 OPEN_CARD_MAX_ATTEMPTS 就置 failed。
     """
     now = now or utcnow()
+    logger.info(
+        "补卡任务执行 task=%s plan=%s status=%s attempts=%d/%d",
+        task.id,
+        task.plan,
+        task.status,
+        task.submit_attempts,
+        max(1, settings.open_card_max_attempts),
+    )
     spec = PLAN_BY_NAME.get(task.plan or "")
     if spec is None or ailink is None:
         _finish_open_card_failed(session, task, "补卡缺少套餐配置或 AiLink 客户端", now)
@@ -272,6 +293,7 @@ def _finish_open_card_succeeded(
     task.claimed_until = None
     task.last_error = note
     crud.save_task(session, task)
+    logger.info("补卡任务完成 task=%s plan=%s note=%s", task.id, task.plan, note or "-")
 
 
 def _finish_open_card_failed(session: Session, task: Task, reason: str, now: datetime) -> None:
@@ -280,7 +302,13 @@ def _finish_open_card_failed(session: Session, task: Task, reason: str, now: dat
     task.next_run_at = now
     task.claimed_until = None
     crud.save_task(session, task)
-    logger.error("补卡任务失败 task=%s plan=%s：%s", task.id, task.plan, reason)
+    logger.error(
+        "补卡任务失败 task=%s plan=%s status=failed 尝试=%d：%s",
+        task.id,
+        task.plan,
+        task.submit_attempts,
+        reason,
+    )
 
 
 async def _quote(
@@ -331,6 +359,14 @@ async def _quote(
     task.display_amount = quote.display_amount
     task.last_error = None
     crud.save_task(session, task)
+    logger.info(
+        "报价成功 task=%s quote=%s plan=%s 金额=%s display=%s",
+        task.id,
+        quote.quote_id,
+        spec.name,
+        quote.authorized_amount_minor,
+        quote.display_amount,
+    )
     return quote
 
 
@@ -378,6 +414,7 @@ def _reuse_own_card(
         crud.release_card(session, card.id or 0, task.request_id)
         task.card_id = None
         crud.save_task(session, task)
+        logger.info("原卡已不可用，释放并重新选卡 task=%s card=%s", task.id, card.card_id)
         return None
 
     if card.reserved_task_id == task.request_id and (
@@ -388,6 +425,13 @@ def _reuse_own_card(
             card.id or 0,
             task.request_id,
             until=now + timedelta(seconds=CARD_RESERVE_SECONDS),
+        )
+        logger.info(
+            "任务复用已锁定的卡 task=%s card=%s balance=%s used=%d",
+            task.id,
+            card.card_id,
+            card.balance,
+            card.used_count,
         )
         return card
 
@@ -422,6 +466,14 @@ def _claim_card(session: Session, task: Task, *, plan: str, now: datetime):
         ):
             task.card_id = card.id
             crud.save_task(session, task)
+            logger.info(
+                "任务选卡成功 task=%s card=%s plan=%s balance=%s used=%d",
+                task.id,
+                card.card_id,
+                plan,
+                card.balance,
+                card.used_count,
+            )
             return card
     return None
 
@@ -462,6 +514,12 @@ async def _submit_order(
     now: datetime,
 ) -> None:
     # 校验阶段没有建单，失败/超时都能安全重试，session 也还要留着
+    logger.info(
+        "订单校验开始 task=%s request=%s quote=%s",
+        task.id,
+        task.request_id,
+        order.get("quote_id"),
+    )
     try:
         await byoc.validate_order(order)
     except PollTimeout as exc:
@@ -496,6 +554,7 @@ async def _submit_order(
         )
         return
 
+    logger.info("订单校验通过 task=%s request=%s", task.id, task.request_id)
     # 一旦发出建单请求就不再重提：只按原 request_id 找回，session 也不再需要
     result: dict[str, Any] | None = None
     submitted = False
@@ -530,6 +589,12 @@ async def _submit_order(
 
     if submitted:
         # 订单已经进了 BYOC，后面只按订单号/原请求号查询，session 密文不再需要
+        logger.info(
+            "订单已提交 task=%s request=%s byoc=%s",
+            task.id,
+            task.request_id,
+            task.byoc_task_id or "-",
+        )
         _clear_payload(session, task)
     if result is not None:
         _apply_order_state(session, task, result, now)
@@ -587,10 +652,27 @@ async def _poll_order(session: Session, task: Task, *, byoc: ByocClient, now: da
 
 
 def _apply_order_state(session: Session, task: Task, order: dict[str, Any], now: datetime) -> None:
+    previous_payment_status = task.payment_status
     task.byoc_task_id = order["task_id"]
     task.payment_status = order["payment_status"]
     task.settlement = order["settlement"]
     task.claimed_until = None
+    if task.payment_status != previous_payment_status:
+        logger.info(
+            "BYOC 订单状态变化 task=%s byoc=%s %s -> %s settlement=%s",
+            task.id,
+            task.byoc_task_id,
+            previous_payment_status or "-",
+            task.payment_status,
+            task.settlement,
+        )
+    else:
+        logger.debug(
+            "BYOC 订单状态未变 task=%s byoc=%s status=%s",
+            task.id,
+            task.byoc_task_id,
+            task.payment_status,
+        )
 
     if order["payment_success"]:
         task.status = STATUS_SUCCEEDED
@@ -629,13 +711,21 @@ def _apply_order_state(session: Session, task: Task, order: dict[str, Any], now:
 
 
 def _mark_unknown(session: Session, task: Task, reason: str, now: datetime) -> None:
+    previous = task.status
     task.status = STATUS_UNKNOWN
     task.last_error = reason[:500]
     task.claimed_until = None
     task.next_run_at = now + timedelta(minutes=5)
     _schedule_callback(session, task, now)
     crud.save_task(session, task)
-    logger.error("订阅任务结果未知，保留卡锁：task=%s reason=%s", task.id, reason)
+    logger.error(
+        "订阅任务结果未知，保留卡锁：task=%s request=%s %s -> %s reason=%s",
+        task.id,
+        task.request_id,
+        previous,
+        task.status,
+        reason,
+    )
 
 
 def _retry_or_fail(
@@ -696,14 +786,35 @@ def _reschedule(
     *,
     error: str | None = None,
 ) -> None:
+    previous = task.status
     task.status = status
     task.next_run_at = next_run_at
     task.claimed_until = None
     task.last_error = error
     crud.save_task(session, task)
+    if previous != status:
+        logger.info(
+            "任务状态变更 task=%s request=%s %s -> %s next_run_at=%s error=%s",
+            task.id,
+            task.request_id,
+            previous,
+            status,
+            next_run_at,
+            error or "-",
+        )
+    else:
+        logger.debug(
+            "任务仍为 %s task=%s request=%s next_run_at=%s error=%s",
+            status,
+            task.id,
+            task.request_id,
+            next_run_at,
+            error or "-",
+        )
 
 
 def _finish_failed(session: Session, task: Task, error: str, now: datetime) -> None:
+    previous = task.status
     task.status = STATUS_FAILED
     task.last_error = error[:500]
     task.next_run_at = now
@@ -712,7 +823,13 @@ def _finish_failed(session: Session, task: Task, error: str, now: datetime) -> N
     task.payload_ciphertext = None
     _release_card(session, task)
     _schedule_callback(session, task, now)
-    logger.error("订阅任务失败 task=%s：%s", task.id, error)
+    logger.error(
+        "订阅任务失败 task=%s request=%s %s -> failed：%s",
+        task.id,
+        task.request_id,
+        previous,
+        error,
+    )
     crud.save_task(session, task)
 
 

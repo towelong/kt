@@ -93,7 +93,9 @@ class Card(TimestampMixin, table=True):
         default=Decimal("0.00"),
         max_digits=18,
         decimal_places=2,
-        description="本地记账余额（USD）：开卡为 0，首充/充值成功加；PROCESSING 扣、失败退",
+        description=(
+            "本地记账余额（USD）：开卡为 0，首充/充值成功加；卡交易首次扣款状态扣、失败/退款退"
+        ),
     )
     applied_at: datetime | None = Field(
         default=None,
@@ -102,7 +104,7 @@ class Card(TimestampMixin, table=True):
     used_count: int = Field(
         default=0,
         ge=0,
-        description="已使用次数：授权成功 +1、失败/退款 -1，最低 0；到 3 停用",
+        description="已使用次数：卡交易首次扣款 +1、失败/退款 -1，最低 0；到 3 停用",
     )
     enabled: bool = Field(
         default=False,
@@ -168,6 +170,15 @@ class CardTransaction(TimestampMixin, table=True):
         max_length=8,
         description="实际金额币种，平台字段 actualCurrency",
     )
+    applied_amount: Decimal = Field(
+        default=Decimal("0.00"),
+        max_digits=18,
+        decimal_places=2,
+        description=(
+            "本交易已实际作用到卡余额的金额（扣款/回款都记正数）；"
+            "AUTH_FAILED 退回时按它加回，避免用被后续状态覆盖的 actual_amount"
+        ),
+    )
     merchant_name: str | None = Field(default=None, max_length=255, description="商户名称")
     transaction_time: datetime | None = Field(
         default=None,
@@ -198,11 +209,11 @@ class CardTransaction(TimestampMixin, table=True):
     )
     use_counted: bool = Field(
         default=False,
-        description="本交易当前是否占用使用次数；按状态目标值做差值，重复推送不重复计",
+        description="本交易是否已应用使用次数；PROCESSING/AUTH_SUCCESS/SETTLED 谁先到谁计一次",
     )
     balance_applied: bool = Field(
         default=False,
-        description="本交易当前是否已影响卡余额；阶段推进时只应用差额",
+        description="本交易是否已应用余额；PROCESSING/AUTH_SUCCESS/SETTLED 谁先到谁扣一次",
     )
 
 

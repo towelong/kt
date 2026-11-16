@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractContextManager
 from datetime import datetime, timedelta
@@ -36,6 +37,9 @@ async def run_once(
     now: datetime | None = None,
 ) -> StockReport | None:
     """跑一轮；别的副本持锁时返回 None。"""
+    started = time.perf_counter()
+    now = now or utcnow()
+    logger.info("卡库存扫描开始 now=%s", now)
     with session_factory() as session:
         crud.ensure_job_lease(session, LEASE_NAME)
         if not crud.acquire_job_lease(
@@ -57,11 +61,12 @@ async def run_once(
             crud.release_job_lease(session, LEASE_NAME)
 
     logger.info(
-        "卡库存扫描完成：缺失=%s 已申请=%s 失败=%s 兑换=%s USDT",
+        "卡库存扫描完成：缺失=%s 已申请=%s 失败=%s 兑换=%s USDT 耗时=%.2fs",
         ",".join(report.missing) or "-",
         ",".join(report.applied) or "-",
         ",".join(report.failed) or "-",
         report.converted_usdt,
+        time.perf_counter() - started,
     )
     return report
 
@@ -76,15 +81,18 @@ async def run_forever(
 ) -> None:
     sleep = sleep or asyncio.sleep
     logger.info("卡库存扫描任务启动，间隔 %ss", interval_seconds)
-    while True:
-        try:
-            await run_once(
-                client=client,
-                session_factory=session_factory,
-                usdt_rate=usdt_rate,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("卡库存扫描任务异常，等待下一轮")
-        await sleep(interval_seconds)
+    try:
+        while True:
+            try:
+                await run_once(
+                    client=client,
+                    session_factory=session_factory,
+                    usdt_rate=usdt_rate,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("卡库存扫描任务异常，等待下一轮")
+            await sleep(interval_seconds)
+    finally:
+        logger.info("卡库存扫描任务停止")

@@ -123,7 +123,7 @@ class SettledToLedger(EventHandler[CardTransactionEvent]):
 - 缺卡时先查账户余额：USD 够直接开；不够按 `CARD_STOCK_USDT_USD_RATE`（默认 0.997）把缺口折成 USDT 兑换，兑换后重新查余额；两边都不够打 `error` 日志并跳过本轮。
 - 卡 BIN 只选 `issuingCountry=US` 且 BIN 以 `5378` 开头的配置；配额用尽或没有匹配 BIN 时打 error。
 - 开卡前先写 `card` 占位行（`request_no` 唯一，含套餐名），余额为 0，超时后下一轮不会重复提交；三要素等开卡 Webhook 补齐、首充 `CARD_OPERATION.RECHARGE_SUCCESS` 到账后才 `enabled`。
-- 交易 Webhook 按 `transaction_id` 落 `card_transaction`：`PROCESSING` 先 +1 并 `balance -= actual_amount`（持有卡行锁，多副本串行）；`AUTH_SUCCESS` / `SETTLED` 只推进状态、次数和余额都不再变；`AUTH_FAILED` 次数 -1 并退回已扣金额；退款/撤销（独立交易）-1 并加回；`CORRECTION` 按负数继续扣、不计次数。同一交易多阶段按差值计算，重投不重复计。
+- 交易 Webhook 按 `transaction_id` 落 `card_transaction`：`PROCESSING` / `AUTH_SUCCESS` / `SETTLED` 三个扣款状态谁先到谁扣一次（`actual_amount > 0` 时 `balance -= actual_amount`、次数 +1），后到的只推进状态；`AUTH_FAILED` 已扣过才按 `applied_amount` 退回并次数 -1；退款/撤销（独立交易）在原交易已扣时 -1 并加回，先到会挂起等原扣款成功再补；`CORRECTION` 按负数继续扣、不计次数。状态只单向推进，同交易多阶段乱序/重投都不重复，卡行加锁串行。
 - 次数到 3 自动停用，退款把次数降回来会重新启用。
 - 卡操作事件落 `card_operation`：充值加余额、转出减余额，`eventId` 唯一约束保证重投不重复加钱；首充成功入账后启用，失败则停用。
 - 多副本部署靠 `job_lease` 抢锁，同一时间只有一个实例真正扫描。
@@ -330,6 +330,21 @@ uv run python -m app.tools.api_keys list
 uv run python -m app.tools.api_keys revoke --prefix kt_a1b2c3d4
 ```
 
+## 日志
+
+日志格式由 `app/log_config.py` 统一配置，uvicorn、Alembic 和业务代码共用同一套 handler：
+
+```
+2026-11-16 11:46:51.321+0800 INFO     [app.jobs.task_worker] 任务开始 task=12 kind=open_subscription plan=plus status=running attempts=1
+2026-11-16 11:46:52.548+0800 INFO     [app.jobs.task_worker] 任务结束 task=12 kind=open_subscription status=succeeded 耗时=1.23s next_run_at=... error=-
+```
+
+- 时间是进程本地时区并带偏移；容器里设置 `TZ=Asia/Shanghai` 就是北京时间。
+- 级别用 `LOG_LEVEL` 控制，默认 `INFO`；SQLAlchemy、httpx 默认压到 WARNING。
+- 任务日志统一带 `task=`、`kind=`、`plan=`、`status=`、`card=`、`request=`、`byoc=` 这些业务键，方便 grep。
+- worker 每隔 `TASK_STATUS_LOG_SECONDS` 打一次队列快照（各状态数量 + 仍在 running 的任务）；设为 0 关闭。
+- 不打印 session、payload 密文、卡号、CVV。
+
 ## 环境变量
 
 全部来自环境变量或 `.env`；带 Secret 的字段用 `SecretStr`，不会出现在 repr 和日志里。
@@ -339,6 +354,8 @@ uv run python -m app.tools.api_keys revoke --prefix kt_a1b2c3d4
 | `DATABASE_URL` | `sqlite:///./app.db` | 数据库连接串；MySQL 用 `mysql+pymysql://用户名:密码@主机:3306/库名?charset=utf8mb4` |
 | `APP_NAME` | `kt` | 应用名，显示在 OpenAPI 标题上 |
 | `DEBUG` | `false` | 打开后 SQLAlchemy 打印 SQL |
+| `LOG_LEVEL` | `INFO` | 日志级别；格式和时间由 `app/log_config.py` 统一 |
+| `TASK_STATUS_LOG_SECONDS` | `60` | 任务队列快照间隔；0 关闭周期快照 |
 | `POOL_SIZE` / `MAX_OVERFLOW` | `5` / `10` | MySQL 连接池大小，SQLite 不用 |
 | `POOL_RECYCLE_SECONDS` | `3600` | MySQL 连接回收秒数 |
 | `API_PREFIX` | `/api` | 业务路由前缀；Webhook 不受它影响 |

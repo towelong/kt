@@ -18,16 +18,13 @@ from app.integrations.ratelimit import RateLimiter
 from app.internal import admin
 from app.jobs.card_stock import run_forever as run_card_stock_job
 from app.jobs.task_worker import run_forever as run_task_worker
+from app.log_config import configure_logging
 from app.migrations import upgrade_to_head
 from app.routers import subscriptions, webhooks
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
-
 logger = logging.getLogger(__name__)
 settings = get_settings()
+configure_logging(settings.log_level)
 
 
 @asynccontextmanager

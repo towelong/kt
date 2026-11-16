@@ -1,6 +1,6 @@
 """Alembic 环境：连接串与元数据都取自应用本身，两种库共用同一套迁移。"""
 
-from logging.config import fileConfig
+import logging
 
 from alembic import context
 from sqlalchemy import create_engine, pool
@@ -10,13 +10,13 @@ from sqlmodel.sql.sqltypes import AutoString, UTCDateTime
 
 import app.models  # noqa: F401  注册所有表
 from app.config import database_backend, get_settings, mask_url
+from app.log_config import configure_logging
 
 config = context.config
+logger = logging.getLogger("alembic.env")
 
-if config.config_file_name is not None:
-    # 默认 disable_existing_loggers=True 会把 uvicorn/app 的 logger 全关掉，
-    # 启动失败时连堆栈都打不出来，所以应用内调用迁移时必须保留现有 logger。
-    fileConfig(config.config_file_name, disable_existing_loggers=False)
+# 不用 alembic.ini 的 logging 配置：它会重配 root，导致启动后日志格式和 uvicorn 不一致。
+configure_logging()
 
 # autogenerate 的比较基准
 target_metadata = SQLModel.metadata
@@ -73,7 +73,7 @@ def run_migrations_online() -> None:
     connectable.dispose()
 
 
-print(f"[alembic] target = {mask_url(make_url(url))} ({database_backend(url)})")
+logger.info("[alembic] target = %s (%s)", mask_url(make_url(url)), database_backend(url))
 
 if context.is_offline_mode():
     run_migrations_offline()

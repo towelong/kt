@@ -36,6 +36,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    from app.log_config import configure_logging
+
+    configure_logging()
     args = _build_parser().parse_args(argv)
 
     with session_scope() as session:

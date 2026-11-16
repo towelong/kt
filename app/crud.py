@@ -1,9 +1,10 @@
 """数据访问层：只碰 Session 和模型，不碰 HTTP。分页统一 offset/limit。"""
 
+from collections.abc import Sequence
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import or_, update
+from sqlalchemy import func, or_, update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, col, select
 
@@ -161,6 +162,25 @@ def create_card_transaction(session: Session, transaction: CardTransaction) -> C
     return transaction
 
 
+def list_pending_refunds(
+    session: Session,
+    *,
+    related_transaction_id: str,
+    statuses: Sequence[str],
+) -> list[CardTransaction]:
+    """退款先于原扣款到达时先挂起，等原交易扣款成功后按它补记。"""
+    stmt = (
+        select(CardTransaction)
+        .where(
+            CardTransaction.related_transaction_id == related_transaction_id,
+            CardTransaction.event_status.in_(statuses),
+            CardTransaction.balance_applied.is_(False),
+        )
+        .with_for_update()
+    )
+    return list(session.exec(stmt).all())
+
+
 def save_card_transaction(
     session: Session,
     transaction: CardTransaction,
@@ -270,6 +290,27 @@ def save_task(session: Session, task: Task) -> Task:
     session.commit()
     session.refresh(task)
     return task
+
+
+def task_status_counts(session: Session) -> dict[str, int]:
+    """任务队列快照：按状态统计，空队列返回空 dict。"""
+    rows = session.execute(select(Task.status, func.count()).group_by(Task.status)).all()
+    return {status: count for status, count in rows}
+
+
+def list_running_tasks(session: Session, *, now: datetime, limit: int = 20) -> list[Task]:
+    """当前仍持有租约的 running 任务，排查“哪个任务卡住了”。"""
+    stmt = (
+        select(Task)
+        .where(
+            Task.status == "running",
+            Task.claimed_until.is_not(None),
+            Task.claimed_until >= now,
+        )
+        .order_by(col(Task.id))
+        .limit(min(limit, MAX_LIMIT))
+    )
+    return list(session.exec(stmt).all())
 
 
 def claim_next_task(session: Session, *, now: datetime, claim_until: datetime) -> Task | None:

@@ -201,6 +201,9 @@ def run(*, page_size: int = 100, dry_run: bool = False) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from app.log_config import configure_logging
+
+    configure_logging()
     parser = argparse.ArgumentParser(description="把 AiLink 平台已有卡同步到本地 card 表")
     parser.add_argument("--dry-run", action="store_true", help="只打印，不写数据库")
     parser.add_argument("--page-size", type=int, default=100, help="每页条数，默认 100")

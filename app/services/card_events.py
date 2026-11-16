@@ -3,12 +3,12 @@
 余额与首充口径：开卡时余额为 0；首充是独立异步流程，只由
 CARD_OPERATION.RECHARGE_SUCCESS 入账，成功前卡不启用。
 
-计数与余额口径（同一 transaction 多次推送，按状态目标值做差值，重试不重复）：
-- PROCESSING：次数 +1，并按 actual_amount 扣卡余额（预先占用）；
-- AUTH_SUCCESS / SETTLED：只推进状态，次数和余额都不再变；
-- AUTH_FAILED：次数 -1，并退回 PROCESSING 已扣的金额；
-- REFUND_SUCCESS / REVERSE_SUCCESS（独立交易）：次数 -1，并加回 actual_amount；
-- CORRECTION：修正金额按负数继续扣，不影响使用次数；
+计数与余额口径（同一 transaction 多次推送，按流水行上的标记幂等）：
+- PROCESSING / AUTH_SUCCESS / SETTLED：三个扣款状态谁先到谁扣一次，
+  有 actual_amount 时扣卡余额并次数 +1，后到的状态只推进状态；
+- AUTH_FAILED：已扣过才退回 applied_amount 并次数 -1；
+- REFUND_SUCCESS / REVERSE_SUCCESS（独立交易）：原交易已扣过才次数 -1 并加回；
+- CORRECTION：修正金额按负数继续扣一次，不影响使用次数；
 - 次数到 3 自动停用，降回 3 以下会重新启用。
 """
 
@@ -34,23 +34,17 @@ logger = logging.getLogger(__name__)
 
 MAX_USES = 3
 
-# 状态变化时对使用次数的增量：PROCESSING 占一次，失败/退款回退一次。
-# AUTH_SUCCESS / SETTLED / CORRECTION 不再额外加；同一状态重复推送不重复应用。
-COUNT_DELTA: dict[str, int] = {
-    "PROCESSING": 1,
-    "AUTH_FAILED": -1,
-    "REFUND_SUCCESS": -1,
-    "REVERSE_SUCCESS": -1,
-}
+# 三个扣款状态共用一次扣减；谁先到谁扣，后到的只推进状态。
+CHARGE_STATUSES = frozenset({"PROCESSING", "AUTH_SUCCESS", "SETTLED"})
+REFUND_STATUSES = frozenset({"REFUND_SUCCESS", "REVERSE_SUCCESS"})
 
-# 该交易对卡余额的目标累计金额符号：
-# PROCESSING 预先扣；AUTH_SUCCESS/SETTLED 不再扣；失败退回；修正继续扣。
-BALANCE_TARGET: dict[str, int] = {
-    "PROCESSING": -1,
-    "AUTH_FAILED": 0,
-    "REFUND_SUCCESS": 1,
-    "REVERSE_SUCCESS": 1,
-    "CORRECTION": -1,
+# 状态只允许单向推进，避免 SETTLED 之后到的 PROCESSING 把状态改回去；
+# AUTH_FAILED 是终态，先到就锁死，后面的扣款状态都不再扣。
+STATUS_RANK: dict[str, int] = {
+    "PROCESSING": 1,
+    "AUTH_SUCCESS": 2,
+    "SETTLED": 3,
+    "AUTH_FAILED": 4,
 }
 
 _KNOWN_PLANS = {plan.value for plan in CardPlan}
@@ -224,21 +218,18 @@ def handle_card_transaction(session: Session, event: CardTransactionEvent) -> No
         return
     status = (data.event_status or "").upper()
 
-    transaction = crud.get_card_transaction(session, data.transaction_id)
-    is_new = transaction is None
+    transaction = crud.get_card_transaction(session, data.transaction_id, for_update=True)
     if transaction is None:
         transaction = CardTransaction(
             transaction_id=data.transaction_id,
             card_id=data.card_id or "",
             event_status="UNKNOWN",
         )
-    prev_status = None if is_new else transaction.event_status
-    prev_actual = Decimal("0") if is_new else (transaction.actual_amount or Decimal("0"))
     transaction.event_id = event.event_id
     if data.card_id:
         transaction.card_id = data.card_id
     if status:
-        transaction.event_status = status
+        _advance_status(transaction, status)
     if data.original_amount is not None:
         transaction.original_amount = data.original_amount
     if data.actual_amount is not None:
@@ -277,47 +268,7 @@ def handle_card_transaction(session: Session, event: CardTransactionEvent) -> No
         crud.save_card_transaction(session, transaction)
         return
 
-    if status != prev_status and status in COUNT_DELTA:
-        delta = COUNT_DELTA[status]
-        before = card.used_count
-        card.used_count = max(0, before + delta)
-        transaction.use_counted = delta > 0
-        logger.info(
-            "卡使用次数变更 card=%s transaction=%s %s %+d：%d -> %d",
-            card.card_id,
-            transaction.transaction_id,
-            status,
-            delta,
-            before,
-            card.used_count,
-        )
-
-    if status in BALANCE_TARGET:
-        previous = BALANCE_TARGET.get(prev_status, 0) * prev_actual
-        target = BALANCE_TARGET[status] * (transaction.actual_amount or Decimal("0"))
-        delta = target - previous
-        if delta:
-            after = card.balance + delta
-            if after < 0:
-                logger.error(
-                    "卡余额不足：card=%s balance=%s 本次扣减=%s transaction=%s status=%s",
-                    card.card_id,
-                    card.balance,
-                    -delta,
-                    transaction.transaction_id,
-                    status,
-                )
-            card.balance = max(Decimal("0"), after)
-            logger.info(
-                "卡余额变更 card=%s transaction=%s %s %+.2f：%s -> %s",
-                card.card_id,
-                transaction.transaction_id,
-                status,
-                delta,
-                card.balance - delta,
-                card.balance,
-            )
-        transaction.balance_applied = target != 0
+    _apply_transaction_effect(session, transaction, status, card)
 
     if status == "AUTH_FAILED":
         logger.error(
@@ -331,6 +282,190 @@ def handle_card_transaction(session: Session, event: CardTransactionEvent) -> No
 
     card.enabled = card_is_ready(card)
     crud.save_card_transaction(session, transaction, card)
+
+
+def _advance_status(transaction: CardTransaction, status: str) -> None:
+    """状态单向推进；退款/修正等独立交易直接覆盖自己的行。"""
+    current = (transaction.event_status or "").upper()
+    if not current or current == "UNKNOWN":
+        transaction.event_status = status
+        return
+    if status in STATUS_RANK and current in STATUS_RANK:
+        if STATUS_RANK[status] >= STATUS_RANK[current]:
+            transaction.event_status = status
+        return
+    transaction.event_status = status
+
+
+def _apply_transaction_effect(
+    session: Session,
+    transaction: CardTransaction,
+    status: str,
+    card: Card,
+) -> None:
+    if status in CHARGE_STATUSES:
+        _apply_charge(session, transaction, card)
+    elif status == "AUTH_FAILED":
+        _revert_charge(transaction, card)
+    elif status in REFUND_STATUSES:
+        _apply_refund(session, transaction, card)
+    elif status == "CORRECTION":
+        _apply_correction(transaction, card)
+
+
+def _apply_charge(session: Session, transaction: CardTransaction, card: Card) -> None:
+    """PROCESSING / AUTH_SUCCESS / SETTLED 谁先到谁扣，后到的只看标记跳过。"""
+    if transaction.balance_applied:
+        return
+    if (transaction.event_status or "").upper() == "AUTH_FAILED":
+        return
+    amount = transaction.actual_amount or Decimal("0")
+    if amount <= 0:
+        # 0 金额不占首次扣款名额，留给后面的 AUTH_SUCCESS / SETTLED
+        return
+
+    before_balance = card.balance
+    deducted = min(before_balance, amount)
+    if deducted < amount:
+        logger.error(
+            "卡余额不足：card=%s balance=%s 本次应扣=%s transaction=%s status=%s",
+            card.card_id,
+            before_balance,
+            amount,
+            transaction.transaction_id,
+            transaction.event_status,
+        )
+    before_count = card.used_count
+    card.balance = before_balance - deducted
+    card.used_count = before_count + 1
+    transaction.applied_amount = deducted
+    transaction.balance_applied = True
+    transaction.use_counted = True
+    logger.info(
+        "卡交易首次扣款 card=%s transaction=%s status=%s 金额=%s 余额=%s -> %s 次数=%d -> %d",
+        card.card_id,
+        transaction.transaction_id,
+        transaction.event_status,
+        deducted,
+        before_balance,
+        card.balance,
+        before_count,
+        card.used_count,
+    )
+
+    # 退款/撤销可能先于原扣款到达，扣款成功后把挂起的退款补上
+    for refund in crud.list_pending_refunds(
+        session,
+        related_transaction_id=transaction.transaction_id,
+        statuses=sorted(REFUND_STATUSES),
+    ):
+        _credit_refund(refund, transaction, card)
+
+
+def _revert_charge(transaction: CardTransaction, card: Card) -> None:
+    if not transaction.balance_applied:
+        return
+    amount = transaction.applied_amount or Decimal("0")
+    before_balance = card.balance
+    before_count = card.used_count
+    card.balance = before_balance + amount
+    if transaction.use_counted:
+        card.used_count = max(0, before_count - 1)
+    transaction.balance_applied = False
+    transaction.use_counted = False
+    transaction.applied_amount = Decimal("0")
+    logger.info(
+        "卡交易失败退回 card=%s transaction=%s 金额=%s 余额=%s -> %s 次数=%d -> %d",
+        card.card_id,
+        transaction.transaction_id,
+        amount,
+        before_balance,
+        card.balance,
+        before_count,
+        card.used_count,
+    )
+
+
+def _apply_refund(session: Session, transaction: CardTransaction, card: Card) -> None:
+    if transaction.balance_applied:
+        return
+    amount = transaction.actual_amount or Decimal("0")
+    if amount <= 0:
+        return
+    if not transaction.related_transaction_id:
+        logger.warning(
+            "退款/撤销缺少关联原交易，暂不记账 transaction=%s status=%s",
+            transaction.transaction_id,
+            transaction.event_status,
+        )
+        return
+    original = crud.get_card_transaction(
+        session,
+        transaction.related_transaction_id,
+        for_update=True,
+    )
+    if original is None or not original.balance_applied:
+        logger.warning(
+            "退款/撤销找不到已扣款的原交易，暂不记账 transaction=%s related=%s",
+            transaction.transaction_id,
+            transaction.related_transaction_id,
+        )
+        return
+    _credit_refund(transaction, original, card)
+
+
+def _credit_refund(transaction: CardTransaction, original: CardTransaction, card: Card) -> None:
+    amount = transaction.actual_amount or Decimal("0")
+    if amount <= 0:
+        return
+    before_balance = card.balance
+    before_count = card.used_count
+    card.balance = before_balance + amount
+    if original.use_counted:
+        card.used_count = max(0, before_count - 1)
+    transaction.applied_amount = amount
+    transaction.balance_applied = True
+    transaction.use_counted = True
+    logger.info(
+        "卡交易退款入账 card=%s transaction=%s related=%s 金额=%s 余额=%s -> %s 次数=%d -> %d",
+        card.card_id,
+        transaction.transaction_id,
+        original.transaction_id,
+        amount,
+        before_balance,
+        card.balance,
+        before_count,
+        card.used_count,
+    )
+
+
+def _apply_correction(transaction: CardTransaction, card: Card) -> None:
+    if transaction.balance_applied:
+        return
+    amount = transaction.actual_amount or Decimal("0")
+    if amount <= 0:
+        return
+    before_balance = card.balance
+    deducted = min(before_balance, amount)
+    if deducted < amount:
+        logger.error(
+            "卡余额不足：card=%s balance=%s 本次修正扣减=%s transaction=%s",
+            card.card_id,
+            before_balance,
+            amount,
+            transaction.transaction_id,
+        )
+    card.balance = before_balance - deducted
+    transaction.applied_amount = deducted
+    transaction.balance_applied = True
+    logger.info(
+        "卡交易修正扣款 card=%s transaction=%s 金额=%s 余额=%s -> %s",
+        card.card_id,
+        transaction.transaction_id,
+        deducted,
+        before_balance,
+        card.balance,
+    )
 
 
 # --------------------------------------------------------------------------- 卡操作事件
