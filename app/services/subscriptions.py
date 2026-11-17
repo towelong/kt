@@ -252,6 +252,24 @@ async def process_open_card_task(
         # 库存任务判定“有可用卡”，但订阅这边只是暂时抢不到卡锁；补卡任务到此为止
         _finish_open_card_succeeded(session, task, "已有可用卡，无需补卡", now)
         return
+    if not report.missing:
+        # 本轮没有缺口可开：同套餐还有在途的开卡申请，正在等 webhook 补三要素/首充。
+        # 这不是补卡失败，不算 submit_attempts，也不覆盖上一轮的真实原因，
+        # 否则等开卡结果的这几轮会把重试预算烧完，任务在 webhook 到达前就 failed 了。
+        _reschedule(
+            session,
+            task,
+            STATUS_PROCESSING,
+            now + timedelta(seconds=OPEN_CARD_RETRY_SECONDS),
+            now,
+            error=task.last_error,
+        )
+        logger.info(
+            "补卡本轮没有缺口可开，等待开卡结果 task=%s plan=%s",
+            task.id,
+            spec.name,
+        )
+        return
 
     reason = report.failure_reasons.get(spec.name) or "本轮没有补到卡"
     task.submit_attempts += 1

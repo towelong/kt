@@ -7,6 +7,7 @@ import httpx
 from sqlmodel import select
 
 from app import crud
+from app.integrations.ailink.errors import AiLinkBusinessError
 from app.jobs.task_worker import run_once
 from app.models import Card, utcnow
 from tests.factories import FakeClient, make_card, us_bin
@@ -21,6 +22,17 @@ def callback_client(status_code=200):
         return httpx.Response(status_code, text="ok")
 
     return httpx.AsyncClient(transport=httpx.MockTransport(handler)), captured
+
+
+class RejectOnceClient(FakeClient):
+    """第一次申请被平台明确拒绝（业务错误），之后恢复正常。"""
+
+    async def apply_cards(self, request, *, request_id=None):
+        if not self.applies:
+            self.calls.append("apply")
+            self.applies.append(request)
+            raise AiLinkBusinessError("余额不足，开卡失败", status_code=400, request_id="req1")
+        return await super().apply_cards(request, request_id=request_id)
 
 
 async def test_run_once_processes_subscription_and_delivers_callback(db_session, session_factory):
@@ -168,6 +180,78 @@ async def test_open_card_waits_for_webhook_in_processing(db_session, session_fac
     assert task.submit_attempts == 1
     assert "等待 webhook" in (task.last_error or "")
     assert task.next_run_at > utcnow()
+    await http.aclose()
+
+
+async def test_open_card_retries_with_new_request_no_after_rejection(db_session, session_factory):
+    """平台拒绝（例如没预留 0.1 开卡费）后，下一轮必须真的重新申请且换新请求号。"""
+    task = crud.create_task(
+        db_session,
+        kind="open_card",
+        plan="plus",
+        request_id="order-202611121000000002",
+    )
+    client = RejectOnceClient(usd="48.10")
+    settings = make_settings(open_card_max_attempts=2)
+    http, _ = callback_client()
+    now = utcnow()
+
+    await run_once(
+        session_factory=session_factory,
+        settings=settings,
+        byoc=None,
+        ailink=client,
+        callback_http=http,
+        now=now,
+    )
+    db_session.refresh(task)
+    assert task.status == "processing"
+    assert task.submit_attempts == 1
+    assert "开卡被平台拒绝" in (task.last_error or "")
+
+    await run_once(
+        session_factory=session_factory,
+        settings=settings,
+        byoc=None,
+        ailink=client,
+        callback_http=http,
+        now=now + timedelta(seconds=121),
+    )
+    db_session.refresh(task)
+    assert task.status == "succeeded"
+    assert len(client.applies) == 2
+    assert client.applies[0].request_no != client.applies[1].request_no
+    await http.aclose()
+
+
+async def test_open_card_waiting_for_webhook_does_not_burn_attempts(db_session, session_factory):
+    """等 webhook 的轮次没有平台交互，不算重试次数，别把任务提前熬成 failed。"""
+    task = crud.create_task(
+        db_session,
+        kind="open_card",
+        plan="plus",
+        request_id="order-202611121000000003",
+    )
+    client = FakeClient(usd="3000.00", deliver_immediately=False)
+    settings = make_settings(open_card_max_attempts=2)
+    http, _ = callback_client()
+    now = utcnow()
+
+    for offset in (0, 121, 242):
+        await run_once(
+            session_factory=session_factory,
+            settings=settings,
+            byoc=None,
+            ailink=client,
+            callback_http=http,
+            now=now + timedelta(seconds=offset),
+        )
+
+    db_session.refresh(task)
+    assert task.status == "processing"
+    assert task.submit_attempts == 1
+    assert "等待 webhook" in (task.last_error or "")
+    assert client.calls.count("apply") == 1
     await http.aclose()
 
 

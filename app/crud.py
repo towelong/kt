@@ -108,6 +108,9 @@ def get_recent_incomplete_card(session: Session, plan: str, since: datetime) -> 
     """近期提交、但还没变成可用卡（等三要素或首充）的占位，避免重复开卡。
 
     首充成功前卡是停用的，也算在途；次数用完被停用的卡不算，应该被下一轮补掉。
+    已经明确失败的占位（开卡被拒 apply_status=FAILED、首充失败）不会再变成可用卡，
+    不能算在途：它们没有卡号，之前会被下面的 card_no IS NULL 一直挡着，
+    导致后续每一轮补卡都空转，而补卡任务的重试次数还在照常消耗。
     """
     stmt = (
         select(Card)
@@ -115,6 +118,8 @@ def get_recent_incomplete_card(session: Session, plan: str, since: datetime) -> 
             Card.plan == plan,
             Card.enabled.is_(False),
             Card.created_at >= since,
+            or_(Card.apply_status.is_(None), Card.apply_status != "FAILED"),
+            or_(Card.initial_funding_status.is_(None), Card.initial_funding_status != "FAILED"),
             or_(
                 Card.apply_status == "PENDING",
                 Card.card_no.is_(None),

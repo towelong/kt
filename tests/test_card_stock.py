@@ -60,11 +60,33 @@ async def test_short_usd_converts_usdt_then_issues(db_session):
 
     report = await replenish(db_session, client, now=utcnow())
 
-    assert client.conversions == [Decimal("2174.53")]
-    assert report.converted_usdt == Decimal("2174.53")
+    # 需求 48.10 + 270.10 + 450.10 + 1410.10，缺口 2168.40 / 0.997 向上取整
+    assert client.conversions == [Decimal("2174.93")]
+    assert report.converted_usdt == Decimal("2174.93")
     assert report.applied == ["plus", "pro100", "pro200", "pro500"]
     cards = db_session.exec(select(Card)).all()
     assert len(cards) == 4
+
+
+async def test_opening_fee_is_part_of_usd_need(db_session):
+    """USD 正好 48.10 够 plus 的首充 + 开卡费，不需要兑换。"""
+    client = FakeClient(usd="48.10", usdt="0.00")
+
+    report = await replenish(db_session, client, now=utcnow(), plans=[PLAN_SPECS[0]])
+
+    assert client.conversions == []
+    assert report.applied == ["plus"]
+    assert client.applies[0].recharge_amount == Decimal("48.00")
+
+
+async def test_short_usd_also_converts_opening_fee(db_session):
+    """USD 48.00 只够首充，还缺 0.10 开卡费，要一起换。"""
+    client = FakeClient(usd="48.00", usdt="1.00")
+
+    report = await replenish(db_session, client, now=utcnow(), plans=[PLAN_SPECS[0]])
+
+    assert client.conversions == [Decimal("0.11")]
+    assert report.applied == ["plus"]
 
 
 async def test_insufficient_balance_logs_error_and_skips(db_session, caplog):
@@ -96,6 +118,27 @@ async def test_recent_incomplete_card_blocks_duplicate_issue(db_session, caplog)
     assert report.missing == []
     assert client.calls == []
     assert "未完成的开卡申请" in caplog.text
+
+
+async def test_rejected_intent_does_not_block_next_round(db_session):
+    """平台明确拒绝的占位没有卡号，但不能再算“在途”，否则下一轮永远开不了。"""
+    for spec in PLAN_SPECS:
+        if spec.name != "plus":
+            add_usable_card(db_session, spec.name)
+    rejected = crud.create_card_intent(
+        db_session,
+        plan="plus",
+        request_no="kaika_plus_rejected0001",
+    )
+    crud.mark_card_failed(db_session, rejected)
+    client = FakeClient(usd="3000.00")
+
+    report = await replenish(db_session, client, now=utcnow())
+
+    assert report.missing == ["plus"]
+    assert report.applied == ["plus"]
+    assert len(client.applies) == 1
+    assert client.applies[0].request_no != rejected.request_no
 
 
 async def test_without_us_bin_logs_error(db_session, caplog):

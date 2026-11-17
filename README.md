@@ -120,7 +120,7 @@ class SettledToLedger(EventHandler[CardTransactionEvent]):
 | pro500 | 470 | 1410 |
 
 - 可用卡 = `enabled`、`used_count < 3`，且余额不低于该套餐单价（plus 16 / pro100 90 / pro200 150 / pro500 470），不够就补新卡。
-- 缺卡时先查账户余额：USD 够直接开；不够按 `CARD_STOCK_USDT_USD_RATE`（默认 0.997）把缺口折成 USDT 兑换，兑换后重新查余额；两边都不够打 `error` 日志并跳过本轮。
+- 缺卡时先查账户余额：USD 够直接开；不够按 `CARD_STOCK_USDT_USD_RATE`（默认 0.997）把缺口折成 USDT 兑换，兑换后重新查余额；两边都不够打 `error` 日志并跳过本轮。USD 需求 = 首充 + 每张 0.10 的开卡费（plus 备 48.10），开卡费固定写在 `PlanSpec.opening_fee`，不放进 `rechargeAmount`。
 - 卡 BIN 只选 `issuingCountry=US` 且 BIN 以 `5378` 开头的配置；配额用尽或没有匹配 BIN 时打 error。
 - 开卡前先写 `card` 占位行（`request_no` 唯一，含套餐名），余额为 0，超时后下一轮不会重复提交；三要素等开卡 Webhook 补齐、首充 `CARD_OPERATION.RECHARGE_SUCCESS` 到账后才 `enabled`。
 - 交易 Webhook 按 `transaction_id` 落 `card_transaction`：`PROCESSING` / `AUTH_SUCCESS` / `SETTLED` 三个扣款状态谁先到谁扣一次（`actual_amount > 0` 时 `balance -= actual_amount`、次数 +1），后到的只推进状态；`AUTH_FAILED` 已扣过才按 `applied_amount` 退回并次数 -1；退款/撤销（独立交易）在原交易已扣时 -1 并加回，先到会挂起等原扣款成功再补；`CORRECTION` 按负数继续扣、不计次数。状态只单向推进，同交易多阶段乱序/重投都不重复，卡行加锁串行。
@@ -181,7 +181,7 @@ worker（`app/jobs/task_worker.py`）执行顺序：
 
 1. 抢任务（条件 UPDATE，多副本只跑一次）。
 2. 按内部套餐选卡并锁定：`enabled`、`used_count < 3`、三要素齐全、未过期、未被别的任务锁住，且卡余额不低于套餐单价；余额不够就投递补卡任务。
-3. 没有卡 → 订阅任务 `waiting_card` 并投递 `open_card` 任务；补卡任务自身用 `processing` 等 webhook/重试，最多 `OPEN_CARD_MAX_ATTEMPTS` 次，之后置 `failed` 并带原因。
+3. 没有卡 → 订阅任务 `waiting_card` 并投递 `open_card` 任务；补卡任务自身用 `processing` 等 webhook/重试，最多 `OPEN_CARD_MAX_ATTEMPTS` 次，之后置 `failed` 并带原因。只有真的调用了平台（余额/BIN/申请）的轮次才累加次数；被在途占位挡住、纯等开卡 webhook 的轮次不计，也不覆盖上一轮的真实原因。
 4. `GET /quotes/{byoc_plan_type}?billing_country=...` 取 `quote_id`，过期就重新报价；金额和币种原样保存供回调/对账，不参与校验。
 5. 组单 → `POST /orders/validate` → `POST /orders`，同一个 `request_id`、同一份 JSON。
 6. 只认 BYOC 的订单状态：`completed + PAID` 成功，`failed/cancelled` 失败，`requires_action` 等 3DS；超时按原 `request_id` 找回，不换号重提。

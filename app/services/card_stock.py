@@ -39,6 +39,8 @@ class PlanSpec:
     # BYOC 的套餐标识和我们内部名字不一样，报价和下单都用这个
     byoc_plan_type: str
     billing_country: str
+    # 平台开卡费：每开一张卡固定收 0.10 USD，从账户余额里扣，不在 recharge_amount 里
+    opening_fee: Decimal = Decimal("0.10")
 
     @property
     def name(self) -> str:
@@ -48,6 +50,11 @@ class PlanSpec:
     def initial_amount(self) -> Decimal:
         """一张卡要撑满 3 次交易，首充 = 单价 × 3。"""
         return (self.unit_price * MAX_USES).quantize(Decimal("0.01"))
+
+    @property
+    def funding_amount(self) -> Decimal:
+        """开一张卡实际要备足的 USD：首充 + 开卡费。"""
+        return (self.initial_amount + self.opening_fee).quantize(Decimal("0.01"))
 
 
 PLAN_SPECS: tuple[PlanSpec, ...] = (
@@ -94,10 +101,22 @@ async def replenish(
         return report
     report.missing = [spec.name for spec in missing]
 
-    total = sum((spec.initial_amount for spec in missing), Decimal("0"))
-    if not await _ensure_usd_balance(client, total, usdt_rate, report):
+    total = sum((spec.funding_amount for spec in missing), Decimal("0.00"))
+    opening_fees = sum((spec.opening_fee for spec in missing), Decimal("0.00"))
+    if not await _ensure_usd_balance(
+        client,
+        total,
+        usdt_rate,
+        report,
+        opening_fees=opening_fees,
+    ):
         for spec in missing:
-            _record_failure(report, spec, "账户余额不足，无法开卡")
+            _record_failure(
+                report,
+                spec,
+                f"账户余额不足，无法开卡（需 {spec.funding_amount} USD，"
+                f"含开卡费 {spec.opening_fee}）",
+            )
         return report
 
     bins = await client.list_card_bins()
@@ -158,6 +177,8 @@ async def _ensure_usd_balance(
     total: Decimal,
     usdt_rate: Decimal,
     report: StockReport,
+    *,
+    opening_fees: Decimal = Decimal("0.00"),
 ) -> bool:
     balance = await client.get_account_balance()
     usd = balance.get("USD")
@@ -174,8 +195,10 @@ async def _ensure_usd_balance(
     usdt_needed = (gap / usdt_rate).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
     if usdt_available < usdt_needed:
         logger.error(
-            "开卡余额不足：需要 %s USD，USD 可用 %s，USDT 可用 %s（按 %s 折算还需 %s USDT）",
+            "开卡余额不足：需要 %s USD（含开卡费 %s），USD 可用 %s，"
+            "USDT 可用 %s（按 %s 折算还需 %s USDT）",
             total,
+            opening_fees,
             usd_available,
             usdt_available,
             usdt_rate,
