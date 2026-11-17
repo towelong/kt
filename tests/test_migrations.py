@@ -1,6 +1,7 @@
 """迁移本身的测试：升级、降级、以及模型与迁移是否已经对齐。"""
 
 import pytest
+import sqlalchemy as sa
 from alembic import command
 from sqlalchemy import create_engine, inspect
 
@@ -22,7 +23,6 @@ def test_upgrade_and_downgrade(db_url):
         "alembic_version",
         "card",
         "card_transaction",
-        "job_lease",
         "task",
     } <= tables
     engine.dispose()
@@ -53,3 +53,37 @@ def test_models_match_migrations(db_url):
 
 def test_head_is_single_revision():
     assert isinstance(head_revision("sqlite://"), str)
+
+
+def test_backfill_outbox_for_in_flight_tasks(db_url):
+    """升级时还在跑的任务要补一条 outbox，否则会永远停在 pending。"""
+    cfg = alembic_config(db_url)
+    command.upgrade(cfg, "4b01a6a7cd73")
+    engine = create_engine(db_url)
+    with engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "INSERT INTO task (created_at, updated_at, id, kind, request_id, status, "
+                "attempts, next_run_at, submit_attempts, callback_attempts, callback_delivered) "
+                "VALUES (CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1, 'open_card', 'order-bf-1', "
+                "'pending', 2, '2026-11-17 00:00:00', 0, 0, 0)"
+            )
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO task (created_at, updated_at, id, kind, request_id, status, "
+                "attempts, next_run_at, submit_attempts, callback_attempts, callback_delivered) "
+                "VALUES (CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 2, 'open_card', 'order-bf-2', "
+                "'succeeded', 3, '2026-11-17 00:00:00', 0, 0, 0)"
+            )
+        )
+
+    command.upgrade(cfg, "head")
+
+    with engine.connect() as conn:
+        rows = conn.execute(sa.text("SELECT task_id, token FROM task_outbox")).all()
+        attempts = conn.execute(sa.text("SELECT attempts FROM task WHERE id = 1")).scalar_one()
+    engine.dispose()
+
+    assert rows == [(1, 3)]
+    assert attempts == 3

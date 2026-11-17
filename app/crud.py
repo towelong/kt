@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import func, or_, update
+from sqlalchemy import delete, func, or_, update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, col, select
 
@@ -13,8 +13,8 @@ from app.models import (
     Card,
     CardOperation,
     CardTransaction,
-    JobLease,
     Task,
+    TaskOutbox,
     utcnow,
 )
 
@@ -203,55 +203,13 @@ def save_card_transaction(
     return transaction
 
 
-# ---------- JobLease ----------
+# ---------- Task（业务状态机）+ TaskOutbox（调度意图） ----------
 
+OUTBOX_RUN = "run"
+OUTBOX_CALLBACK = "callback"
 
-def ensure_job_lease(session: Session, name: str) -> None:
-    if session.get(JobLease, name) is not None:
-        return
-    session.add(JobLease(name=name))
-    try:
-        session.commit()
-    except IntegrityError:
-        # 另一个副本同时插入，谁先提交都一样，忽略即可
-        session.rollback()
-
-
-def acquire_job_lease(session: Session, name: str, *, locked_until: datetime) -> bool:
-    """条件 UPDATE 抢锁，SQLite 和 MySQL 语义一致；rowcount=1 表示抢到。"""
-    ensure_job_lease(session, name)
-    stmt = (
-        update(JobLease)
-        .where(JobLease.name == name, JobLease.locked_until <= utcnow())
-        .values(locked_until=locked_until, updated_at=utcnow())
-    )
-    result = session.execute(stmt)
-    session.commit()
-    return result.rowcount == 1
-
-
-def release_job_lease(session: Session, name: str) -> None:
-    stmt = (
-        update(JobLease)
-        .where(JobLease.name == name)
-        .values(locked_until=utcnow(), updated_at=utcnow())
-    )
-    session.execute(stmt)
-    session.commit()
-
-
-# ---------- Task（数据库任务队列） ----------
-
-CLAIMABLE_TASK_STATUSES = (
-    "pending",
-    "waiting_card",
-    "waiting_quote",
-    "processing",
-    "waiting_action",
-    "unknown",
-    # 认领后 worker 崩溃的任务；只有 claimed_until 过期才会被重新抢到
-    "running",
-)
+# 补卡任务在途判定：这些状态表示同套餐已经有一次开卡没走完
+OPEN_CARD_IN_FLIGHT_STATUSES = ("pending", "running", "processing", "waiting_card")
 
 
 def create_task(
@@ -264,8 +222,12 @@ def create_task(
     callback_url: str | None = None,
     api_key_id: int | None = None,
     status: str = "pending",
-    next_run_at: datetime | None = None,
+    run_at: datetime | None = None,
 ) -> Task:
+    """建任务并排一次执行：任务行和 outbox 在同一个事务里落库。
+
+    `run_at` 不传就是马上跑；任务一旦存在就必须有调度意图，否则会永远停在 pending。
+    """
     task = Task(
         kind=kind,
         plan=plan,
@@ -274,9 +236,11 @@ def create_task(
         callback_url=callback_url,
         api_key_id=api_key_id,
         status=status,
-        next_run_at=next_run_at or utcnow(),
     )
     session.add(task)
+    session.flush()
+    task.attempts = 1
+    session.add(TaskOutbox(task_id=task.id, kind=OUTBOX_RUN, run_at=run_at or utcnow(), token=1))
     session.commit()
     session.refresh(task)
     return task
@@ -297,52 +261,74 @@ def save_task(session: Session, task: Task) -> Task:
     return task
 
 
+def save_task_with_outbox(
+    session: Session,
+    task: Task,
+    *,
+    kind: str,
+    run_at: datetime,
+    token: int | None = None,
+) -> Task:
+    """任务状态和调度意图一次提交：要么都写进去，要么都不写。"""
+    task.updated_at = utcnow()
+    session.add(task)
+    session.flush()
+    session.add(TaskOutbox(task_id=task.id, kind=kind, run_at=run_at, token=token))
+    session.commit()
+    session.refresh(task)
+    return task
+
+
+def has_pending_outbox(session: Session, task_id: int, kind: str) -> bool:
+    """同一种调度是否已经有没被 ack 的行，避免重复排回调。"""
+    stmt = (
+        select(TaskOutbox.id).where(TaskOutbox.task_id == task_id, TaskOutbox.kind == kind).limit(1)
+    )
+    return session.exec(stmt).first() is not None
+
+
+def list_outbox(
+    session: Session,
+    *,
+    limit: int = 20,
+    run_kinds: Sequence[str] | None = None,
+) -> list[TaskOutbox]:
+    """还没被 worker ack 的调度意图，publisher 每轮取一批投递。
+
+    延迟交给 arq 的 `_defer_by`：所以这里不按 run_at 过滤，早投晚跑；
+    同一条行用固定 `_job_id` 反复投递，arq 侧去重，Redis 丢了还能补。
+
+    `run_kinds` 只过滤“执行任务”的行（例如 BYOC 没配置时只跑补卡）；
+    回调行不受影响，已经产出的结果该发还是要发。
+    """
+    stmt = (
+        select(TaskOutbox)
+        .join(Task, Task.id == TaskOutbox.task_id)
+        .order_by(col(TaskOutbox.run_at), col(TaskOutbox.id))
+        .limit(min(limit, MAX_LIMIT))
+    )
+    if run_kinds is not None:
+        stmt = stmt.where(
+            or_(TaskOutbox.kind != OUTBOX_RUN, Task.kind.in_(run_kinds)),
+        )
+    return list(session.exec(stmt).all())
+
+
+def delete_outbox(session: Session, outbox_id: int) -> None:
+    """worker 开始执行时 ack：删掉这条调度意图，publisher 不再重投。"""
+    session.execute(delete(TaskOutbox).where(TaskOutbox.id == outbox_id))
+    session.commit()
+
+
 def task_status_counts(session: Session) -> dict[str, int]:
     """任务队列快照：按状态统计，空队列返回空 dict。"""
     rows = session.execute(select(Task.status, func.count()).group_by(Task.status)).all()
     return {status: count for status, count in rows}
 
 
-def list_running_tasks(session: Session, *, now: datetime, limit: int = 20) -> list[Task]:
-    """当前仍持有租约的 running 任务，排查“哪个任务卡住了”。"""
-    stmt = (
-        select(Task)
-        .where(
-            Task.status == "running",
-            Task.claimed_until.is_not(None),
-            Task.claimed_until >= now,
-        )
-        .order_by(col(Task.id))
-        .limit(min(limit, MAX_LIMIT))
-    )
-    return list(session.exec(stmt).all())
-
-
-def claim_next_task(session: Session, *, now: datetime, claim_until: datetime) -> Task | None:
-    """条件 UPDATE 抢一条待执行任务；多副本只有一个能抢到。"""
-    free = or_(Task.claimed_until.is_(None), Task.claimed_until < now)
-    candidate = session.exec(
-        select(Task.id)
-        .where(Task.status.in_(CLAIMABLE_TASK_STATUSES), Task.next_run_at <= now, free)
-        .order_by(col(Task.next_run_at), col(Task.id))
-        .limit(1)
-    ).first()
-    if candidate is None:
-        return None
-    result = session.execute(
-        update(Task)
-        .where(
-            Task.id == candidate,
-            Task.status.in_(CLAIMABLE_TASK_STATUSES),
-            Task.next_run_at <= now,
-            free,
-        )
-        .values(status="running", claimed_until=claim_until, attempts=Task.attempts + 1)
-    )
-    session.commit()
-    if result.rowcount != 1:
-        return None
-    return session.get(Task, candidate)
+def pending_outbox_count(session: Session) -> int:
+    """还没被执行/投递确认的调度条数，排查“排队了但没跑”。"""
+    return session.execute(select(func.count()).select_from(TaskOutbox)).scalar_one()
 
 
 def find_open_card_task(session: Session, plan: str) -> Task | None:
@@ -355,26 +341,11 @@ def find_open_card_task(session: Session, plan: str) -> Task | None:
         .where(
             Task.kind == "open_card",
             Task.plan == plan,
-            Task.status.in_(("pending", "running", "processing", "waiting_card")),
+            Task.status.in_(OPEN_CARD_IN_FLIGHT_STATUSES),
         )
         .order_by(col(Task.id))
     )
     return session.exec(stmt).first()
-
-
-def list_due_callbacks(session: Session, now: datetime, limit: int = 20) -> list[Task]:
-    stmt = (
-        select(Task)
-        .where(
-            Task.callback_url.is_not(None),
-            Task.callback_delivered.is_(False),
-            Task.callback_next_at.is_not(None),
-            Task.callback_next_at <= now,
-        )
-        .order_by(col(Task.callback_next_at), col(Task.id))
-        .limit(limit)
-    )
-    return list(session.exec(stmt).all())
 
 
 # ---------- 订阅用卡锁定 ----------

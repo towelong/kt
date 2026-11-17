@@ -43,13 +43,18 @@ tests/
 uv sync
 cp .env.example .env
 uv run alembic upgrade head     # 建表/升级，等价于启动时自动跑的那一步
-uv run uvicorn app.main:app --reload
+uv run uvicorn app.main:app --reload        # API（不跑任务）
+uv run arq app.jobs.arq_worker.WorkerSettings   # 任务 worker（单独进程）
 ```
 
 - 文档：http://127.0.0.1:8000/docs
 - 健康检查：`GET /health`
+- worker 存活：`uv run arq --check app.jobs.arq_worker.WorkerSettings`
 - 当前库自检：`GET /internal/admin/db-info`
 - 迁移是否跑齐：`GET /internal/admin/migration-state`（`current` 应等于 `head`）
+
+任务执行需要 Redis（默认 `REDIS_URL=redis://localhost:6379`，生产建议独立实例并开 AOF）；
+API 进程不连 Redis，也不跑任务。worker 崩了不会丢任务：`task_outbox` 的行没被 ack 就会被重新投递。
 
 启动时默认**不会**自动迁移（`AUTO_MIGRATE` 默认 `false`）。开发环境用 `.env` 里的 `AUTO_MIGRATE=true` 或手动 `alembic upgrade head`；生产/多副本一律在发布流程里单独跑迁移，避免并发。
 
@@ -110,7 +115,7 @@ class SettledToLedger(EventHandler[CardTransactionEvent]):
 
 ### 卡库存与计数
 
-`CARD_STOCK_ENABLED=true` 后，lifespan 里会起一个进程内任务（`app/jobs/card_stock.py`），每 `CARD_STOCK_INTERVAL_SECONDS` 扫一轮：
+`CARD_STOCK_ENABLED=true` 后，worker 会注册一个 cron（`app/jobs/arq_worker.py`），每 `CARD_STOCK_INTERVAL_SECONDS` 扫一轮：
 
 | 套餐 | 单价 | 首充（3 次） |
 | --- | --- | --- |
@@ -126,7 +131,7 @@ class SettledToLedger(EventHandler[CardTransactionEvent]):
 - 交易 Webhook 按 `transaction_id` 落 `card_transaction`：`PROCESSING` / `AUTH_SUCCESS` / `SETTLED` 三个扣款状态谁先到谁扣一次（`actual_amount > 0` 时 `balance -= actual_amount`、次数 +1），后到的只推进状态；`AUTH_FAILED` 已扣过才按 `applied_amount` 退回并次数 -1；退款/撤销（独立交易）在原交易已扣时 -1 并加回，先到会挂起等原扣款成功再补；`CORRECTION` 按负数继续扣、不计次数。状态只单向推进，同交易多阶段乱序/重投都不重复，卡行加锁串行。
 - 次数到 3 自动停用，退款把次数降回来会重新启用。
 - 卡操作事件落 `card_operation`：充值加余额、转出减余额，`eventId` 唯一约束保证重投不重复加钱；首充成功入账后启用，失败则停用。
-- 多副本部署靠 `job_lease` 抢锁，同一时间只有一个实例真正扫描。
+- 多副本部署靠 arq cron 的 `unique=True`，同一个时间点只有一个实例真正扫描。
 
 平台已有卡可以一次性同步进本地 `card` 表（按 `cardId` 幂等，不会重复插入）：
 
@@ -177,10 +182,10 @@ curl -X POST http://127.0.0.1:8000/api/subscriptions \
 - `GET` 只能查自己 key 提交的任务，别的 key 一律 404，不暴露任务是否存在。
 - 卡库存、补卡任务和 VCC Webhook 不用这套鉴权。
 
-worker（`app/jobs/task_worker.py`）执行顺序：
+worker（`app/jobs/arq_worker.py`）执行顺序：
 
-1. 抢任务（条件 UPDATE，多副本只跑一次）。
-2. 按内部套餐选卡并锁定：`enabled`、`used_count < 3`、三要素齐全、未过期、未被别的任务锁住，且卡余额不低于套餐单价；余额不够就投递补卡任务。
+1. 业务代码改状态时，在同一个事务里往 `task_outbox` 写一条“什么时候再跑”（`crud.save_task_with_outbox`）；`publish_outbox` 每 `ARQ_DISPATCH_SECONDS` 把这些行换算成 arq 的 `_defer_by` 投递出去，`_job_id` 用行号去重；worker 开始执行时才删行（ack），没 ack 的行会被反复重投，Redis 丢消息也能自愈。
+2. `run_task` 按内部套餐选卡并锁定：`enabled`、`used_count < 3`、三要素齐全、未过期、未被别的任务锁住，且卡余额不低于套餐单价；余额不够就投递补卡任务。
 3. 没有卡 → 订阅任务 `waiting_card` 并投递 `open_card` 任务；补卡任务自身用 `processing` 等 webhook/重试，最多 `OPEN_CARD_MAX_ATTEMPTS` 次，之后置 `failed` 并带原因。只有真的调用了平台（余额/BIN/申请）的轮次才累加次数；被在途占位挡住、纯等开卡 webhook 的轮次不计，也不覆盖上一轮的真实原因。
 4. `GET /quotes/{byoc_plan_type}?billing_country=...` 取 `quote_id`，过期就重新报价；金额和币种原样保存供回调/对账，不参与校验。
 5. 组单 → `POST /orders/validate` → `POST /orders`，同一个 `request_id`、同一份 JSON。
@@ -335,14 +340,14 @@ uv run python -m app.tools.api_keys revoke --prefix kt_a1b2c3d4
 日志格式由 `app/log_config.py` 统一配置，uvicorn、Alembic 和业务代码共用同一套 handler：
 
 ```
-2026-11-16 11:46:51.321+0800 INFO     [app.jobs.task_worker] 任务开始 task=12 kind=open_subscription plan=plus status=running attempts=1
-2026-11-16 11:46:52.548+0800 INFO     [app.jobs.task_worker] 任务结束 task=12 kind=open_subscription status=succeeded 耗时=1.23s next_run_at=... error=-
+2026-11-16 11:46:51.321+0800 INFO     [app.jobs.arq_worker] 任务开始 task=12 kind=open_subscription plan=plus status=running attempts=1
+2026-11-16 11:46:52.548+0800 INFO     [app.jobs.arq_worker] 任务结束 task=12 kind=open_subscription status=succeeded 耗时=1.23s next_run_at=... error=-
 ```
 
 - 时间是进程本地时区并带偏移；容器里设置 `TZ=Asia/Shanghai` 就是北京时间。
 - 级别用 `LOG_LEVEL` 控制，默认 `INFO`；SQLAlchemy、httpx 默认压到 WARNING。
 - 任务日志统一带 `task=`、`kind=`、`plan=`、`status=`、`card=`、`request=`、`byoc=` 这些业务键，方便 grep。
-- worker 每隔 `TASK_STATUS_LOG_SECONDS` 打一次队列快照（各状态数量 + 仍在 running 的任务）；设为 0 关闭。
+- worker 每隔 `TASK_STATUS_LOG_SECONDS` 打一次队列快照（各状态数量 + 待投递的调度条数）；设为 0 关闭。
 - 不打印 session、payload 密文、卡号、CVV。
 
 ## 环境变量
@@ -368,7 +373,7 @@ uv run python -m app.tools.api_keys revoke --prefix kt_a1b2c3d4
 | `AILINK_TIMEOUT_SECONDS` | `10` | VCC 请求超时 |
 | `AILINK_WEBHOOK_MAX_BODY_BYTES` | `1048576` | Webhook 正文上限，超出返回 413 |
 | `AILINK_WEBHOOK_DEBUG` | `false` | 排查开关：成功请求也打印 header/body，敏感字段自动打码；生产关闭 |
-| `CARD_STOCK_ENABLED` | `false` | 是否启动卡库存扫描任务 |
+| `CARD_STOCK_ENABLED` | `false` | 是否注册卡库存扫描 cron |
 | `CARD_STOCK_INTERVAL_SECONDS` | `300` | 扫描间隔 |
 | `CARD_STOCK_PENDING_MINUTES` | `30` | 有未完成开卡申请时，这段时间内不重复开卡 |
 | `CARD_STOCK_USDT_USD_RATE` | `0.997` | USDT→USD 折算率，10 USDT 约 9.97 USD |
@@ -377,8 +382,13 @@ uv run python -m app.tools.api_keys revoke --prefix kt_a1b2c3d4
 | `BYOC_API_KEY` | 空 | BYOC API Key，放在 `X-API-Key` |
 | `BYOC_CALLBACK_SECRET` | 空 | 回调签名密钥，拼在 `k=v&...` 后面做 MD5 |
 | `TASK_PAYLOAD_KEY` | 空 | 任务 payload 的 AES-256-GCM 密钥；32 字节 base64 或任意字符串（内部 SHA256 派生） |
-| `SUBSCRIPTION_WORKER_ENABLED` | `false` | 是否启动订阅任务 worker |
-| `SUBSCRIPTION_WORKER_INTERVAL_SECONDS` | `10` | worker 轮询间隔 |
+| `REDIS_URL` | `redis://localhost:6379` | arq 用的 Redis；生产建议独立实例 + AOF |
+| `ARQ_QUEUE_NAME` | `arq:kt` | 队列名 |
+| `ARQ_MAX_JOBS` | `4` | 单个 worker 进程内同时跑几条任务 |
+| `ARQ_JOB_TIMEOUT` | `120` | 单条任务最长执行时间（秒） |
+| `ARQ_HEALTH_CHECK_INTERVAL` | `30` | worker 心跳间隔（秒），`arq --check` 用 |
+| `ARQ_DISPATCH_SECONDS` | `5` | dispatcher 扫库投递任务的间隔（秒） |
+| `SUBSCRIPTION_WORKER_ENABLED` | `false` | 是否注册 dispatcher cron、是否处理订阅任务 |
 | `SUBSCRIPTION_CALLBACK_MAX_ATTEMPTS` | `5` | 回调最多尝试几次，超过后放弃 |
 | `SUBSCRIPTION_MAX_SUBMIT_ATTEMPTS` | `10` | BYOC 取报价/校验/建单失败最多重试几次（同 `request_id`），超过才置为失败 |
 | `SUBSCRIPTION_RETRY_BACKOFF_SECONDS` | `60` | 失败重试的首次退避秒数，之后翻倍 |

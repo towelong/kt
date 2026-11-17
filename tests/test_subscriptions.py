@@ -21,6 +21,7 @@ from app.routers.subscriptions import router as subscriptions_router
 from app.services.subscriptions import (
     CALLBACK_HEADER,
     KIND_OPEN_CARD,
+    _schedule_callback,
     build_callback_body,
     create_subscription_task,
     deliver_callback,
@@ -28,7 +29,7 @@ from app.services.subscriptions import (
     process_subscription_task,
     sign_callback,
 )
-from tests.factories import make_card
+from tests.factories import make_card, task_outbox
 
 PAYLOAD_KEY = "test-payload-key"
 CALLBACK_SECRET = "cb-secret"
@@ -160,7 +161,7 @@ async def test_successful_subscription_builds_order_and_locks_then_releases_card
     assert task.display_amount == "USD $20.00"
     assert task.payload_ciphertext is None
     assert card.reserved_until is None and card.reserved_task_id is None
-    assert task.callback_next_at is not None
+    assert task_outbox(db_session, task.id or 0, "callback")
 
     assert byoc.quotes == [("plus", "ph")]
     sent = byoc.created[0]
@@ -204,8 +205,9 @@ async def test_byoc_rejection_keeps_payload_and_retries(db_session):
     assert task.payload_ciphertext is not None
     assert task.card_id == card.id
     assert card.reserved_until is None
-    assert task.callback_next_at is None
-    assert task.next_run_at > utcnow()
+    assert task_outbox(db_session, task.id or 0, "callback") == []
+    runs = task_outbox(db_session, task.id or 0, "run")
+    assert runs and runs[-1].run_at > utcnow()
 
 
 async def test_byoc_failure_fails_after_retry_limit(db_session):
@@ -215,8 +217,6 @@ async def test_byoc_failure_fails_after_retry_limit(db_session):
     byoc = FakeByoc(create_error=APIError(400, {"message": "卡被拒绝"}))
 
     for attempt in range(1, 4):
-        task.next_run_at = utcnow() - timedelta(seconds=1)
-        crud.save_task(db_session, task)
         await process_subscription_task(db_session, task, byoc=byoc, settings=settings)
 
         db_session.refresh(task)
@@ -224,13 +224,14 @@ async def test_byoc_failure_fails_after_retry_limit(db_session):
         if attempt < 3:
             assert task.status == "pending"
             assert task.payload_ciphertext is not None
+            assert task_outbox(db_session, task.id or 0, "run")
 
     db_session.refresh(card)
     assert task.status == "failed"
     assert "不再重试" in (task.last_error or "")
     assert task.payload_ciphertext is None
     assert card.reserved_until is None
-    assert task.callback_next_at is not None
+    assert task_outbox(db_session, task.id or 0, "callback")
 
 
 async def test_unknown_outcome_keeps_card_locked(db_session):
@@ -246,7 +247,24 @@ async def test_unknown_outcome_keeps_card_locked(db_session):
     assert task.card_id == card.id
     assert task.payload_ciphertext is None
     assert card.reserved_until is not None
-    assert task.callback_next_at is not None
+    assert task_outbox(db_session, task.id or 0, "callback")
+
+
+def test_callback_is_scheduled_once_until_acked(db_session):
+    """状态变多次也只排一条回调，等 worker ack 后才允许再排。"""
+    task = new_task(db_session)
+    task.callback_url = "https://merchant.example/cb"
+    crud.save_task(db_session, task)
+
+    _schedule_callback(db_session, task, utcnow())
+    _schedule_callback(db_session, task, utcnow())
+    rows = task_outbox(db_session, task.id or 0, "callback")
+    assert len(rows) == 1
+
+    crud.delete_outbox(db_session, rows[0].id or 0)
+    _schedule_callback(db_session, task, utcnow())
+
+    assert len(task_outbox(db_session, task.id or 0, "callback")) == 1
 
 
 def test_callback_signature_and_body():
@@ -307,7 +325,11 @@ async def test_callback_retries_then_gives_up(db_session):
         assert delivered is False
         db_session.refresh(task)
         assert task.callback_attempts == 1
-        assert task.callback_next_at is not None
+        pending = task_outbox(db_session, task.id or 0, "callback")
+        assert pending and pending[-1].run_at > utcnow()
+        # 模拟 worker 已经 ack 掉这一条，再验证下一轮失败不再排新的
+        for row in pending:
+            crud.delete_outbox(db_session, row.id or 0)
 
         later = utcnow() + timedelta(minutes=10)
         assert (
@@ -317,7 +339,7 @@ async def test_callback_retries_then_gives_up(db_session):
 
     db_session.refresh(task)
     assert task.callback_attempts == 2
-    assert task.callback_next_at is None
+    assert task_outbox(db_session, task.id or 0, "callback") == []
     assert task.callback_delivered is False
 
 

@@ -22,7 +22,7 @@ app/
 ├── integrations/    # 外部服务对接（每个 vendor 一个子包）
 │   └── ailink/      # AiLink VCC 客户端、事件模型、Webhook 验签与分发
 ├── services/        # 业务编排：跨 crud 组合、决策、调用 integrations
-├── jobs/            # 定时任务：进程内 asyncio + 数据库租约
+├── jobs/            # 任务执行：arq worker（独立进程）、执行器、调度
 ├── routers/         # 只做 HTTP：参数、状态码、错误翻译
 └── internal/        # 不属于某个资源的内部/运维逻辑
 migrations/          # Alembic 环境与版本脚本，必须入库
@@ -38,7 +38,10 @@ tests/
 - 外部 HTTP 服务统一封装在 `app/integrations/<vendor>/`：签名、重试、错误翻译、事件模型都在里面，路由只做「解析请求 → 调集成层 → 翻译响应」。
 - 集成层的密钥只从 `Settings` 取，类型用 `SecretStr`；日志和异常里不出现明文、不打印请求/响应正文。
 - 业务编排放 `app/services/`，只调 `crud` 读写，不写 SQL；Webhook 处理器和定时任务都经 services 落库。
-- 定时任务放 `app/jobs/`：必须能从配置关掉、必须用 `job_lease` 抢锁、异常只记日志不退出循环。
+- 任务执行放 `app/jobs/`：arq worker 是独立进程（`arq app.jobs.arq_worker.WorkerSettings`），数据库仍是状态机；
+  调度一律走 `task_outbox`（`crud.save_task_with_outbox`，和状态同事务写入），业务代码里不要直接 `enqueue_job`；
+  定时任务用 arq cron 的 `unique=True` 保证多副本只跑一次，必须能从配置关掉；
+  业务异常写回数据库重试，不许把 worker 循环带崩。
 
 ## 命名与日志
 

@@ -32,6 +32,19 @@ class Settings(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     # 任务队列快照间隔（秒），0 表示只在任务开始/结束时打日志
     task_status_log_seconds: int = 60
+
+    # Redis / arq 任务队列。worker 是独立进程：arq app.jobs.arq_worker.WorkerSettings
+    # 数据库仍然是调度源，Redis 只决定“什么时候、在哪个进程里跑”
+    redis_url: str = "redis://localhost:6379"
+    arq_queue_name: str = "arq:kt"
+    # 一个 worker 进程内同时跑几条任务（asyncio 协程并发）
+    arq_max_jobs: int = 4
+    # 单条任务最长执行时间，超时由 arq 取消
+    arq_job_timeout: int = 120
+    # worker 往 Redis 写心跳的间隔，arq --check 用它判断存活
+    arq_health_check_interval: int = 30
+    # dispatcher 扫库、把到期任务投递给 arq 的间隔（秒）
+    arq_dispatch_seconds: int = 5
     # 启动时自动执行 alembic upgrade head。默认关闭，开发环境在 .env 里打开；
     # 生产/多副本一律在发布流程里单独跑迁移
     auto_migrate: bool = False
@@ -64,7 +77,6 @@ class Settings(BaseSettings):
     # 任务里 session 落库用的 AES-256-GCM key：32 字节 base64，或任意字符串（内部 SHA256 派生）
     task_payload_key: SecretStr | None = None
     subscription_worker_enabled: bool = False
-    subscription_worker_interval_seconds: int = 10
     subscription_callback_max_attempts: int = 5
     # BYOC 失败一律保留 payload 重试（同 request_id），达到次数才置为失败
     subscription_max_submit_attempts: int = 10

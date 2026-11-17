@@ -4,6 +4,9 @@
 """
 
 from decimal import Decimal
+from types import SimpleNamespace
+
+from sqlmodel import select
 
 from app import crud
 from app.integrations.ailink.models import (
@@ -15,7 +18,7 @@ from app.integrations.ailink.models import (
     CardBinResult,
     CurrencyBalance,
 )
-from app.models import Card
+from app.models import Card, TaskOutbox, utcnow
 from app.services.card_stock import PLAN_SPECS
 
 WEBHOOK_SECRET = "whsec_test_secret"
@@ -335,3 +338,117 @@ def operation_event(
     if card_issue_request_no:
         data["cardIssueRequestNo"] = card_issue_request_no
     return parse(make_body, event_id, event_type, "CARD_OPERATION", data)
+
+
+# --------------------------------------------------------------------------- 任务队列（arq）
+
+
+def task_outbox(session, task_id: int, kind: str | None = None) -> list[TaskOutbox]:
+    """任务当前的调度意图，按 id 排序；用来断言“排了几次、什么时候跑”。
+
+    先 expire_all：SQLite 删除后会复用行号，identity map 里的旧对象会盖住新行。
+    """
+    session.expire_all()
+    stmt = select(TaskOutbox).where(TaskOutbox.task_id == task_id)
+    if kind is not None:
+        stmt = stmt.where(TaskOutbox.kind == kind)
+    return list(session.exec(stmt.order_by(TaskOutbox.id)).all())
+
+
+def schedule_run(session, task, *, run_at):
+    """测试用：按业务语义排下一次执行（attempts+1 + 写 outbox），返回 outbox 行。"""
+    task.attempts += 1
+    crud.save_task_with_outbox(
+        session,
+        task,
+        kind=crud.OUTBOX_RUN,
+        run_at=run_at,
+        token=task.attempts,
+    )
+    return task_outbox(session, task.id or 0, crud.OUTBOX_RUN)[-1]
+
+
+class FakeRedis:
+    """只实现 dispatcher 用到的 enqueue_job：记录消息、按 _job_id 去重、可模拟连接失败。"""
+
+    def __init__(self) -> None:
+        self.jobs: list[tuple[str, tuple, dict]] = []
+        self.job_ids: set[str] = set()
+        self.fail_next = False
+
+    async def enqueue_job(self, name, *args, **kwargs):
+        if self.fail_next:
+            self.fail_next = False
+            raise RuntimeError("redis 连接失败")
+        job_id = kwargs.get("_job_id")
+        if job_id is not None:
+            if job_id in self.job_ids:
+                return None
+            self.job_ids.add(job_id)
+        self.jobs.append((name, args, kwargs))
+        return SimpleNamespace(job_id=job_id)
+
+
+def make_ctx(
+    settings,
+    session_factory,
+    *,
+    byoc=None,
+    ailink=None,
+    callback_http=None,
+    redis=None,
+) -> dict:
+    """arq job 的 ctx：和 WorkerSettings.ctx + on_startup 注入的键保持一致。"""
+    return {
+        "settings": settings,
+        "session_factory": session_factory,
+        "byoc": byoc,
+        "ailink": ailink,
+        "callback_http": callback_http,
+        "redis": redis or FakeRedis(),
+    }
+
+
+def _outbox_id(args: tuple) -> int:
+    """两种消息的最后一个位置参数都是 outbox 行号。"""
+    return args[-1]
+
+
+def _outbox_row(ctx, outbox_id: int):
+    with ctx["session_factory"]() as session:
+        return session.get(TaskOutbox, outbox_id)
+
+
+def _prune_stale(ctx) -> None:
+    """删掉指向已 ack 行的假消息，避免残留导致空转。"""
+    redis = ctx["redis"]
+    redis.jobs = [job for job in redis.jobs if _outbox_row(ctx, _outbox_id(job[1])) is not None]
+
+
+async def drain_queue(ctx, *, now=None, max_rounds: int = 50) -> int:
+    """publisher 投递 → 执行 → 再投递，直到没有到点的调度；返回执行的消息数。
+
+    延迟用 outbox 行的 `run_at` 判断，和真实 arq 的 `_defer_by` 语义一致。
+    """
+    from app.jobs.arq_worker import deliver_task_callback, publish_outbox, run_task
+
+    handlers = {"run_task": run_task, "deliver_task_callback": deliver_task_callback}
+    now = now or utcnow()
+    executed = 0
+    for _ in range(max_rounds):
+        await publish_outbox(ctx, now=now)
+        job = None
+        for index, candidate in enumerate(ctx["redis"].jobs):
+            row = _outbox_row(ctx, _outbox_id(candidate[1]))
+            if row is not None and row.run_at <= now:
+                job = ctx["redis"].jobs.pop(index)
+                break
+        if job is None:
+            _prune_stale(ctx)
+            return executed
+        name, args, kwargs = job
+        await handlers[name](ctx, *args, now=now)
+        # 真实 arq 里任务完成后 job_id 会被释放（keep_result=0），假 broker 也照做
+        ctx["redis"].job_ids.discard(kwargs.get("_job_id"))
+        executed += 1
+    raise AssertionError("队列没有收敛，可能存在投递死循环")

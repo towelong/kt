@@ -51,6 +51,7 @@ CALLBACK_BACKOFF_SECONDS = (60, 300, 900, 3600, 10800)
 CARD_RESERVE_SECONDS = 600
 POLL_INTERVAL_SECONDS = 30
 OPEN_CARD_RETRY_SECONDS = 120
+UNKNOWN_RETRY_SECONDS = 300
 
 
 def new_request_id(now: datetime | None = None) -> str:
@@ -131,6 +132,7 @@ def create_subscription_task(
         payload_ciphertext=ciphertext,
         callback_url=callback_url,
         api_key_id=api_key_id,
+        run_at=utcnow(),
     )
 
 
@@ -143,6 +145,7 @@ def enqueue_open_card(session: Session, plan: str) -> Task | None:
         kind=KIND_OPEN_CARD,
         plan=plan,
         request_id=new_request_id(),
+        run_at=utcnow(),
     )
 
 
@@ -198,7 +201,7 @@ async def process_subscription_task(
         card = _claim_card(session, task, plan=spec.name, now=now)
     if card is None:
         enqueue_open_card(session, spec.name)
-        _reschedule(session, task, STATUS_WAITING_CARD, now + timedelta(seconds=60), now)
+        _reschedule(session, task, STATUS_WAITING_CARD, 60, now)
         logger.warning("订阅任务等待可用卡：task=%s plan=%s", task.id, spec.name)
         return
 
@@ -260,7 +263,7 @@ async def process_open_card_task(
             session,
             task,
             STATUS_PROCESSING,
-            now + timedelta(seconds=OPEN_CARD_RETRY_SECONDS),
+            OPEN_CARD_RETRY_SECONDS,
             now,
             error=task.last_error,
         )
@@ -286,7 +289,7 @@ async def process_open_card_task(
         session,
         task,
         STATUS_PROCESSING,
-        now + timedelta(seconds=OPEN_CARD_RETRY_SECONDS),
+        OPEN_CARD_RETRY_SECONDS,
         now,
         error=reason[:500],
     )
@@ -307,8 +310,6 @@ def _finish_open_card_succeeded(
     now: datetime,
 ) -> None:
     task.status = STATUS_SUCCEEDED
-    task.next_run_at = now
-    task.claimed_until = None
     task.last_error = note
     crud.save_task(session, task)
     logger.info("补卡任务完成 task=%s plan=%s note=%s", task.id, task.plan, note or "-")
@@ -317,8 +318,6 @@ def _finish_open_card_succeeded(
 def _finish_open_card_failed(session: Session, task: Task, reason: str, now: datetime) -> None:
     task.status = STATUS_FAILED
     task.last_error = reason[:500]
-    task.next_run_at = now
-    task.claimed_until = None
     crud.save_task(session, task)
     logger.error(
         "补卡任务失败 task=%s plan=%s status=failed 尝试=%d：%s",
@@ -356,7 +355,7 @@ async def _quote(
             session,
             task,
             STATUS_WAITING_QUOTE,
-            now + timedelta(seconds=30),
+            30,
             now,
             error="报价已过期，重新报价",
         )
@@ -635,7 +634,7 @@ async def _poll_order(session: Session, task: Task, *, byoc: ByocClient, now: da
                 session,
                 task,
                 STATUS_PROCESSING,
-                now + timedelta(seconds=POLL_INTERVAL_SECONDS),
+                POLL_INTERVAL_SECONDS,
                 now,
                 error=f"查询订单失败：{exc}"[:500],
             )
@@ -651,7 +650,7 @@ async def _poll_order(session: Session, task: Task, *, byoc: ByocClient, now: da
             session,
             task,
             STATUS_UNKNOWN,
-            now + timedelta(minutes=5),
+            UNKNOWN_RETRY_SECONDS,
             now,
             error=f"找回订单失败：{exc}"[:500],
         )
@@ -661,7 +660,7 @@ async def _poll_order(session: Session, task: Task, *, byoc: ByocClient, now: da
             session,
             task,
             STATUS_UNKNOWN,
-            now + timedelta(minutes=5),
+            UNKNOWN_RETRY_SECONDS,
             now,
             error="原请求号暂时查不到订单，稍后继续核对",
         )
@@ -674,7 +673,6 @@ def _apply_order_state(session: Session, task: Task, order: dict[str, Any], now:
     task.byoc_task_id = order["task_id"]
     task.payment_status = order["payment_status"]
     task.settlement = order["settlement"]
-    task.claimed_until = None
     if task.payment_status != previous_payment_status:
         logger.info(
             "BYOC 订单状态变化 task=%s byoc=%s %s -> %s settlement=%s",
@@ -695,7 +693,6 @@ def _apply_order_state(session: Session, task: Task, order: dict[str, Any], now:
     if order["payment_success"]:
         task.status = STATUS_SUCCEEDED
         task.last_error = None
-        task.next_run_at = now
         _release_card(session, task)
         _schedule_callback(session, task, now)
         logger.info("订阅开通成功 task=%s byoc=%s", task.id, task.byoc_task_id)
@@ -705,16 +702,14 @@ def _apply_order_state(session: Session, task: Task, order: dict[str, Any], now:
     if state in {"failed", "cancelled"}:
         task.status = STATUS_FAILED
         task.last_error = "BYOC 订单失败"
-        task.next_run_at = now
         _release_card(session, task)
         _schedule_callback(session, task, now)
         logger.error("订阅开通失败 task=%s byoc=%s state=%s", task.id, task.byoc_task_id, state)
         return
 
     if state == "requires_action":
-        task.status = STATUS_WAITING_ACTION
-        task.next_run_at = now + timedelta(seconds=POLL_INTERVAL_SECONDS)
         _schedule_callback(session, task, now)
+        _reschedule(session, task, STATUS_WAITING_ACTION, POLL_INTERVAL_SECONDS, now)
         logger.warning("订阅需要用户完成 3DS task=%s byoc=%s", task.id, task.byoc_task_id)
         return
 
@@ -723,19 +718,13 @@ def _apply_order_state(session: Session, task: Task, order: dict[str, Any], now:
         return
 
     # queued / processing：继续轮询，卡保持锁定
-    task.status = STATUS_PROCESSING
-    task.next_run_at = now + timedelta(seconds=POLL_INTERVAL_SECONDS)
-    crud.save_task(session, task)
+    _reschedule(session, task, STATUS_PROCESSING, POLL_INTERVAL_SECONDS, now)
 
 
 def _mark_unknown(session: Session, task: Task, reason: str, now: datetime) -> None:
     previous = task.status
-    task.status = STATUS_UNKNOWN
-    task.last_error = reason[:500]
-    task.claimed_until = None
-    task.next_run_at = now + timedelta(minutes=5)
     _schedule_callback(session, task, now)
-    crud.save_task(session, task)
+    _reschedule(session, task, STATUS_UNKNOWN, UNKNOWN_RETRY_SECONDS, now, error=reason[:500])
     logger.error(
         "订阅任务结果未知，保留卡锁：task=%s request=%s %s -> %s reason=%s",
         task.id,
@@ -777,7 +766,7 @@ def _retry_or_fail(
         delay_seconds if delay_seconds is not None else _retry_delay(task.submit_attempts, settings)
     )
     _release_card(session, task)
-    _reschedule(session, task, status, now + timedelta(seconds=delay), now, error=message)
+    _reschedule(session, task, status, delay, now, error=message)
     logger.warning(
         "BYOC 失败，保留 payload 稍后重试 task=%s plan=%s 第 %d/%d 次 %ss 后：%s",
         task.id,
@@ -799,34 +788,43 @@ def _reschedule(
     session: Session,
     task: Task,
     status: str,
-    next_run_at: datetime,
+    delay_seconds: float,
     now: datetime,
     *,
     error: str | None = None,
 ) -> None:
+    """把任务排到 `delay_seconds` 之后：状态和调度意图在同一个事务里落库。"""
     previous = task.status
     task.status = status
-    task.next_run_at = next_run_at
-    task.claimed_until = None
     task.last_error = error
-    crud.save_task(session, task)
+    task.attempts += 1
+    run_at = now + timedelta(seconds=delay_seconds)
+    crud.save_task_with_outbox(
+        session,
+        task,
+        kind=crud.OUTBOX_RUN,
+        run_at=run_at,
+        token=task.attempts,
+    )
     if previous != status:
         logger.info(
-            "任务状态变更 task=%s request=%s %s -> %s next_run_at=%s error=%s",
+            "任务状态变更 task=%s request=%s %s -> %s run_at=%s 第 %d 次 error=%s",
             task.id,
             task.request_id,
             previous,
             status,
-            next_run_at,
+            run_at,
+            task.attempts,
             error or "-",
         )
     else:
         logger.debug(
-            "任务仍为 %s task=%s request=%s next_run_at=%s error=%s",
+            "任务仍为 %s task=%s request=%s run_at=%s 第 %d 次 error=%s",
             status,
             task.id,
             task.request_id,
-            next_run_at,
+            run_at,
+            task.attempts,
             error or "-",
         )
 
@@ -835,8 +833,6 @@ def _finish_failed(session: Session, task: Task, error: str, now: datetime) -> N
     previous = task.status
     task.status = STATUS_FAILED
     task.last_error = error[:500]
-    task.next_run_at = now
-    task.claimed_until = None
     # 终态不再需要 session 密文，失败和成功一样在这里清掉
     task.payload_ciphertext = None
     _release_card(session, task)
@@ -863,9 +859,19 @@ def _clear_payload(session: Session, task: Task) -> None:
 
 
 def _schedule_callback(session: Session, task: Task, now: datetime) -> None:
-    if task.callback_url and not task.callback_delivered:
-        task.callback_next_at = now
-    crud.save_task(session, task)
+    """状态变了就排一次回调；已经有一条待投递的就不重复排，让那条带最新状态。"""
+    if not task.callback_url or task.callback_delivered:
+        crud.save_task(session, task)
+        return
+    if crud.has_pending_outbox(session, task.id or 0, crud.OUTBOX_CALLBACK):
+        crud.save_task(session, task)
+        return
+    crud.save_task_with_outbox(
+        session,
+        task,
+        kind=crud.OUTBOX_CALLBACK,
+        run_at=now,
+    )
 
 
 # --------------------------------------------------------------------------- 回调
@@ -895,7 +901,6 @@ async def deliver_callback(
     if 200 <= response.status_code < 300:
         task.callback_delivered = True
         task.callback_attempts += 1
-        task.callback_next_at = None
         crud.save_task(session, task)
         logger.info("订阅回调成功 task=%s status=%s", task.id, task.status)
         return True
@@ -913,12 +918,16 @@ def _reschedule_callback(
     task.callback_attempts += 1
     task.last_error = error[:500]
     if task.callback_attempts >= settings.subscription_callback_max_attempts:
-        task.callback_next_at = None
         logger.error("订阅回调放弃 task=%s attempts=%d", task.id, task.callback_attempts)
-    else:
-        delay = CALLBACK_BACKOFF_SECONDS[
-            min(task.callback_attempts - 1, len(CALLBACK_BACKOFF_SECONDS) - 1)
-        ]
-        task.callback_next_at = now + timedelta(seconds=delay)
-        logger.error("订阅回调失败，稍后重试 task=%s：%s", task.id, error)
-    crud.save_task(session, task)
+        crud.save_task(session, task)
+        return
+    delay = CALLBACK_BACKOFF_SECONDS[
+        min(task.callback_attempts - 1, len(CALLBACK_BACKOFF_SECONDS) - 1)
+    ]
+    logger.error("订阅回调失败，稍后重试 task=%s：%s", task.id, error)
+    crud.save_task_with_outbox(
+        session,
+        task,
+        kind=crud.OUTBOX_CALLBACK,
+        run_at=now + timedelta(seconds=delay),
+    )

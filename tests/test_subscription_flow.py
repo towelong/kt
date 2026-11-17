@@ -11,10 +11,9 @@ import httpx
 
 from app import crud
 from app.integrations.byoc.client import ByocClient
-from app.jobs.task_worker import run_once
 from app.models import utcnow
 from app.services.subscriptions import sign_callback
-from tests.factories import make_card
+from tests.factories import drain_queue, make_card, make_ctx
 from tests.test_subscriptions import (
     CALLBACK_SECRET,
     SESSION,
@@ -131,19 +130,15 @@ async def test_subscription_end_to_end(db_session, session_factory, api_key):
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(callback_handler(captured))
     ) as callback_http:
-        processed = await run_once(
-            session_factory=session_factory,
-            settings=settings,
-            byoc=byoc,
-            ailink=None,
-            callback_http=callback_http,
+        executed = await drain_queue(
+            make_ctx(settings, session_factory, byoc=byoc, callback_http=callback_http),
             now=utcnow(),
         )
 
     await byoc.aclose()
 
     # 任务走完：报价 → 校验 → 下单，每个 HTTP 请求占一个限流配额
-    assert processed == 1
+    assert executed == 2
     assert paths == [
         "GET /api/v1/external/quotes/plus",
         "POST /api/v1/external/orders/validate",
@@ -233,12 +228,8 @@ async def test_subscription_end_to_end_byoc_failure(db_session, session_factory,
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(callback_handler(captured))
     ) as callback_http:
-        await run_once(
-            session_factory=session_factory,
-            settings=settings,
-            byoc=byoc,
-            ailink=None,
-            callback_http=callback_http,
+        await drain_queue(
+            make_ctx(settings, session_factory, byoc=byoc, callback_http=callback_http),
             now=utcnow(),
         )
     await byoc.aclose()
@@ -281,12 +272,8 @@ async def test_subscription_endpoint_without_card_enqueues_opening(
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(callback_handler(captured))
     ) as callback_http:
-        await run_once(
-            session_factory=session_factory,
-            settings=settings,
-            byoc=byoc,
-            ailink=None,
-            callback_http=callback_http,
+        await drain_queue(
+            make_ctx(settings, session_factory, byoc=byoc, callback_http=callback_http),
             now=utcnow(),
         )
     await byoc.aclose()

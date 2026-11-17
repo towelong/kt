@@ -1,7 +1,6 @@
-"""卡库存策略：缺口计算、余额/兑换、BIN 选择、租约、跨层联动。"""
+"""卡库存策略：缺口计算、余额/兑换、BIN 选择、跨层联动。"""
 
 import logging
-from datetime import timedelta
 from decimal import Decimal
 
 from sqlmodel import select
@@ -203,37 +202,6 @@ async def test_business_rejection_marks_card_failed(db_session, caplog):
     cards = db_session.exec(select(Card)).all()
     assert len(cards) == 4
     assert all(card.apply_status == "FAILED" and not card.enabled for card in cards)
-
-
-def test_job_lease_is_exclusive(db_session):
-    crud.ensure_job_lease(db_session, "card_stock")
-
-    assert (
-        crud.acquire_job_lease(
-            db_session,
-            "card_stock",
-            locked_until=utcnow() + timedelta(minutes=5),
-        )
-        is True
-    )
-    assert (
-        crud.acquire_job_lease(
-            db_session,
-            "card_stock",
-            locked_until=utcnow() + timedelta(minutes=5),
-        )
-        is False
-    )
-
-    crud.release_job_lease(db_session, "card_stock")
-    assert (
-        crud.acquire_job_lease(
-            db_session,
-            "card_stock",
-            locked_until=utcnow() + timedelta(minutes=5),
-        )
-        is True
-    )
 
 
 async def test_webhook_issued_card_is_usable(db_session, make_body, encrypt_field):

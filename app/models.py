@@ -217,21 +217,12 @@ class CardTransaction(TimestampMixin, table=True):
     )
 
 
-class JobLease(SQLModel, table=True):
-    """多副本定时任务的数据库租约，跨 SQLite/MySQL 都靠条件 UPDATE 抢锁。"""
-
-    __tablename__ = "job_lease"
-
-    name: str = Field(max_length=64, primary_key=True, description="任务名，一个任务一行")
-    locked_until: datetime = Field(
-        default_factory=utcnow,
-        description="租约到期时间；小于当前时间表示没人持锁",
-    )
-    updated_at: datetime = Field(default_factory=utcnow, description="最后续锁/释放时间（UTC）")
-
-
 class Task(TimestampMixin, table=True):
-    """数据库任务队列：开卡和订阅下单共用，worker 用条件 UPDATE 抢占。
+    """任务状态机：开卡和订阅下单共用，所有状态、结果和重试计数都在这一行。
+
+    调度不在表里：改状态时用 `crud.save_task_with_outbox` 往 `task_outbox` 写一条
+    “什么时候再跑”的意图，worker 真正开始执行时才 ack 掉；`attempts` 既是重试计数，
+    也是消息令牌（旧令牌的消息会被丢弃）。
 
     session 只以 AES-GCM 密文存在 payload_ciphertext 里，建单成功或进入终态时清空；
     提交失败（取报价/校验/建单）保留密文，按 submit_attempts 退避重试。
@@ -285,22 +276,17 @@ class Task(TimestampMixin, table=True):
             "waiting_card 只属于订阅任务等卡，补卡任务用 processing 等 webhook/重试"
         ),
     )
-    attempts: int = Field(default=0, ge=0, description="已认领执行次数，排查重试风暴用")
+    attempts: int = Field(
+        default=0,
+        ge=0,
+        description="已排定的执行次数，同时是消息令牌：旧令牌的消息直接丢弃",
+    )
     submit_attempts: int = Field(
         default=0,
         ge=0,
         description=(
             "失败重试次数：BYOC 取报价/校验/建单失败、补卡未完成都累加；达到各自上限才置为失败"
         ),
-    )
-    next_run_at: datetime = Field(
-        default_factory=utcnow,
-        index=True,
-        description="下次允许执行时间（UTC），退避和轮询都靠它",
-    )
-    claimed_until: datetime | None = Field(
-        default=None,
-        description="本次认领的租约到期时间；过期后可被其它 worker 重新认领",
     )
     card_id: int | None = Field(
         default=None,
@@ -341,14 +327,36 @@ class Task(TimestampMixin, table=True):
         description="结果回调地址（http/https），为空则不回调",
     )
     callback_attempts: int = Field(default=0, ge=0, description="回调已尝试次数")
-    callback_next_at: datetime | None = Field(
-        default=None,
-        index=True,
-        description="下次回调时间（UTC）；为空表示不用再回调",
-    )
     callback_delivered: bool = Field(
         default=False,
         description="回调是否已被接收（2xx）；成功后不再重试",
+    )
+
+
+class TaskOutbox(TimestampMixin, table=True):
+    """待投递给 arq 的调度意图，和业务状态在同一个事务里写。
+
+    publisher 每几秒扫一次到期行、投递成 arq 的延迟消息；worker 真正开始执行时
+    才删掉对应行（ack）。没 ack 的行会被反复重投，靠稳定的 `_job_id` 在 arq 侧去重，
+    所以 Redis 丢消息也能自愈。
+    """
+
+    __tablename__ = "task_outbox"
+
+    id: int | None = Field(default=None, primary_key=True, description="自增主键")
+    task_id: int = Field(
+        foreign_key="task.id",
+        index=True,
+        description="关联的任务（task.id）",
+    )
+    kind: str = Field(
+        max_length=16,
+        description="投递类型：run（执行任务）/ callback（投递回调）",
+    )
+    run_at: datetime = Field(index=True, description="最早可以投递的时间（UTC）")
+    token: int | None = Field(
+        default=None,
+        description="run 消息的令牌，等于调度时的 task.attempts；callback 为空",
     )
 
 
