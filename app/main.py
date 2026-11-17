@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
-from app.db import session_scope
+from app.db import safe_url, session_scope
 from app.integrations.ailink.handlers import dispatcher
 from app.internal import admin
 from app.log_config import configure_logging
@@ -26,6 +26,7 @@ configure_logging(settings.log_level)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    logger.info("API 启动：数据库=%s 自动迁移=%s", safe_url(), settings.auto_migrate)
     if settings.auto_migrate:
         upgrade_to_head()
 

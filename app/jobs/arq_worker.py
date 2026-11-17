@@ -33,6 +33,7 @@ from app.integrations.ailink.client import AiLinkClient
 from app.integrations.byoc.client import ByocClient
 from app.integrations.ratelimit import RateLimiter
 from app.jobs.executor import execute_task, log_queue_status
+from app.log_config import configure_logging
 from app.models import utcnow
 from app.services.card_stock import replenish
 from app.services.subscriptions import (
@@ -278,6 +279,9 @@ async def card_stock_scan(ctx, *, now: datetime | None = None) -> None:
 # --------------------------------------------------------------------------- 生命周期
 
 settings = get_settings()
+# arq 的 CLI 只配置自己的 logger，root 会停在 WARNING；不显式配一遍，
+# 业务代码里的 INFO 日志（订阅执行、报价、选卡、任务开始/结束）全都不会输出。
+configure_logging(settings.log_level)
 
 
 def _cron_jobs(current: Settings) -> list:

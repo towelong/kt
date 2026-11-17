@@ -1,0 +1,103 @@
+name: kt
+
+x-app: &app
+  image: registry.xiaozi.cc/towelong/kt:f7a2e9c
+  networks:
+    - "1panel-network"
+
+x-env: &app-env
+  TZ: Asia/Shanghai
+  APP_NAME: kt
+  DEBUG: "false"
+  LOG_LEVEL: INFO
+  API_PREFIX: /api
+  CORS_ORIGINS: "[]"
+  # 任务队列快照间隔（秒），0 关闭
+  TASK_STATUS_LOG_SECONDS: "60"
+  # api 启动时跑 alembic upgrade head；worker 关掉（见下面覆盖）
+  AUTO_MIGRATE: "true"
+  POOL_SIZE: "5"
+  MAX_OVERFLOW: "10"
+  POOL_RECYCLE_SECONDS: "3600"
+  DATABASE_URL: ${DATABASE_URL}
+  REDIS_URL: ${REDIS_URL}
+
+  # AiLink VCC
+  AILINK_BASE_URL: "https://card.ailinkvcc.com"
+  AILINK_API_KEY: ${AILINK_API_KEY}
+  AILINK_API_SECRET: ${AILINK_API_SECRET}
+  AILINK_WEBHOOK_SECRET: ${AILINK_WEBHOOK_SECRET}
+  AILINK_TIMEOUT_SECONDS: "10"
+  AILINK_WEBHOOK_MAX_BODY_BYTES: "1048576"
+  AILINK_WEBHOOK_DEBUG: "false"
+  AILINK_RATE_LIMIT_PER_MINUTE: "450"
+
+  # 卡库存扫描
+  CARD_STOCK_ENABLED: "false"
+  CARD_STOCK_INTERVAL_SECONDS: "300"
+  CARD_STOCK_PENDING_MINUTES: "30"
+  CARD_STOCK_USDT_USD_RATE: "0.997"
+  OPEN_CARD_MAX_ATTEMPTS: "5"
+
+  # BYOC 订阅
+  BYOC_BASE_URL: "https://wangbohui.com"
+  BYOC_API_KEY: ${BYOC_API_KEY}
+  BYOC_CALLBACK_SECRET: ${BYOC_CALLBACK_SECRET}
+  TASK_PAYLOAD_KEY: ${TASK_PAYLOAD_KEY}
+  SUBSCRIPTION_WORKER_ENABLED: "true"
+  SUBSCRIPTION_CALLBACK_MAX_ATTEMPTS: "5"
+  SUBSCRIPTION_MAX_SUBMIT_ATTEMPTS: "10"
+  SUBSCRIPTION_RETRY_BACKOFF_SECONDS: "60"
+  SUBSCRIPTION_RETRY_MAX_BACKOFF_SECONDS: "300"
+  BYOC_RATE_LIMIT_PER_MINUTE: "300"
+
+  # arq
+  ARQ_QUEUE_NAME: arq:kt
+  ARQ_MAX_JOBS: "4"
+  ARQ_JOB_TIMEOUT: "120"
+  ARQ_HEALTH_CHECK_INTERVAL: "30"
+  ARQ_DISPATCH_SECONDS: "5"
+
+services:
+  api:
+    <<: *app
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment: *app-env
+    ports:
+      - "127.0.0.1:8098:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/health")
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      # 首次启动要跑迁移，给足时间
+      start_period: 30s
+    restart: unless-stopped
+
+  worker:
+    <<: *app
+    command: ["arq", "app.jobs.arq_worker.WorkerSettings"]
+    environment:
+      <<: *app-env
+      # 迁移只由 api 跑，worker 不重复执行
+      AUTO_MIGRATE: "false"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "arq", "--check", "app.jobs.arq_worker.WorkerSettings"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    # 收到 SIGTERM 后等手上的任务跑完（WorkerSettings.job_completion_wait=30）
+    stop_grace_period: 45s
+    restart: unless-stopped
+
+networks:
+  "1panel-network":
+    external: true

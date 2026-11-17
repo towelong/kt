@@ -12,4 +12,5 @@ tests
 README.md
 AGENTS.md
 Dockerfile
+docker-compose.yml
 .dockerignore

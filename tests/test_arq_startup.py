@@ -163,3 +163,15 @@ def test_empty_secret_is_not_treated_as_configured():
     assert settings.ailink_configured is False
     assert settings.byoc_configured is False
     assert settings.task_payload_configured is False
+
+
+def test_worker_process_configures_app_logging():
+    """worker 是独立进程，必须自己配 root；否则业务 INFO 日志全被丢掉。"""
+    import logging
+
+    from app.jobs import arq_worker
+    from app.log_config import AppFormatter
+
+    root = logging.getLogger()
+    assert root.level == getattr(logging, arq_worker.settings.log_level.upper())
+    assert any(isinstance(handler.formatter, AppFormatter) for handler in root.handlers)

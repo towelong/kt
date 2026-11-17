@@ -8,7 +8,7 @@ from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from sqlalchemy.engine import Engine
 
-from app.config import get_settings
+from app.config import database_backend, get_settings, mask_url
 
 logger = logging.getLogger(__name__)
 
@@ -24,9 +24,23 @@ def alembic_config(url: str | None = None) -> Config:
 
 
 def upgrade_to_head(url: str | None = None) -> None:
-    logger.info("开始迁移数据库")
-    command.upgrade(alembic_config(url), "head")
-    logger.info("数据库迁移完成")
+    target = url or get_settings().database_url
+    # 连不上库时最容易看错的就是“到底连的哪个地址”，这里先打脱敏后的目标
+    logger.info(
+        "开始迁移数据库 target=%s backend=%s",
+        mask_url(target),
+        database_backend(target),
+    )
+    try:
+        command.upgrade(alembic_config(target), "head")
+    except Exception:
+        logger.error(
+            "数据库迁移失败 target=%s：检查 DATABASE_URL 的主机/端口/账号，"
+            "容器里的 127.0.0.1 不是宿主机（用 host.docker.internal 或服务名）",
+            mask_url(target),
+        )
+        raise
+    logger.info("数据库迁移完成 target=%s", mask_url(target))
 
 
 def current_revision(engine: Engine) -> str | None:

@@ -12,7 +12,9 @@ from datetime import datetime
 
 LOG_FORMAT = "%(asctime)s %(levelname)-8s [%(name)s] %(message)s"
 
-_UVICORN_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access")
+# 这些 logger 自己会装 handler（uvicorn / arq CLI），统一换成我们的格式并关掉向上传播，
+# 否则同一条记录会被打印两次。
+_OWNED_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access", "arq")
 _QUIET_LOGGERS = ("sqlalchemy.engine", "httpx", "httpcore")
 
 
@@ -29,7 +31,7 @@ class AppFormatter(logging.Formatter):
 
 
 def configure_logging(level: str | None = None) -> None:
-    """统一 root、uvicorn 和安静第三方 logger；重复调用不会叠 handler。"""
+    """统一 root、uvicorn/arq 和安静第三方 logger；重复调用不会叠 handler。"""
     from app.config import get_settings
 
     resolved = (level or get_settings().log_level or "INFO").upper()
@@ -41,7 +43,7 @@ def configure_logging(level: str | None = None) -> None:
     root.addHandler(handler)
     root.setLevel(resolved)
 
-    for name in _UVICORN_LOGGERS:
+    for name in _OWNED_LOGGERS:
         logger = logging.getLogger(name)
         logger.handlers.clear()
         logger.addHandler(handler)

@@ -345,6 +345,7 @@ uv run python -m app.tools.api_keys revoke --prefix kt_a1b2c3d4
 ```
 
 - 时间是进程本地时区并带偏移；容器里设置 `TZ=Asia/Shanghai` 就是北京时间。
+- API 和 worker 是两个进程：业务任务日志（订阅执行、报价、选卡、补卡）只在 worker 里，`docker compose logs -f worker` 看；两边格式一致。
 - 级别用 `LOG_LEVEL` 控制，默认 `INFO`；SQLAlchemy、httpx 默认压到 WARNING。
 - 任务日志统一带 `task=`、`kind=`、`plan=`、`status=`、`card=`、`request=`、`byoc=` 这些业务键，方便 grep。
 - worker 每隔 `TASK_STATUS_LOG_SECONDS` 打一次队列快照（各状态数量 + 待投递的调度条数）；设为 0 关闭。
