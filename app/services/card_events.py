@@ -6,6 +6,8 @@ CARD_OPERATION.RECHARGE_SUCCESS 入账，成功前卡不启用。
 计数与余额口径（同一 transaction 多次推送，按流水行上的标记幂等）：
 - PROCESSING / AUTH_SUCCESS / SETTLED：三个扣款状态谁先到谁扣一次，
   有 actual_amount 时扣卡余额并次数 +1，后到的状态只推进状态；
+  平台在 SETTLED 阶段会换一个新的 transactionId 并用 relatedTransactionId 指回原单，
+  所以去重要看整条关联链，链上已经有扣款行就只记流水、不再动余额和次数；
 - AUTH_FAILED：已扣过才退回 applied_amount 并次数 -1；
 - REFUND_SUCCESS / REVERSE_SUCCESS（独立交易）：原交易已扣过才次数 -1 并加回；
 - CORRECTION：修正金额按负数继续扣一次，不影响使用次数；
@@ -37,6 +39,9 @@ MAX_USES = 3
 # 三个扣款状态共用一次扣减；谁先到谁扣，后到的只推进状态。
 CHARGE_STATUSES = frozenset({"PROCESSING", "AUTH_SUCCESS", "SETTLED"})
 REFUND_STATUSES = frozenset({"REFUND_SUCCESS", "REVERSE_SUCCESS"})
+
+# 同一笔扣款的关联链最多追这么多层，脏数据成环时也不会绕死
+MAX_CHAIN_DEPTH = 5
 
 # 状态只允许单向推进，避免 SETTLED 之后到的 PROCESSING 把状态改回去；
 # AUTH_FAILED 是终态，先到就锁死，后面的扣款状态都不再扣。
@@ -306,11 +311,79 @@ def _apply_transaction_effect(
     if status in CHARGE_STATUSES:
         _apply_charge(session, transaction, card)
     elif status == "AUTH_FAILED":
-        _revert_charge(transaction, card)
+        _revert_charge(session, transaction, card)
     elif status in REFUND_STATUSES:
         _apply_refund(session, transaction, card)
     elif status == "CORRECTION":
         _apply_correction(transaction, card)
+
+
+def _holds_charge(transaction: CardTransaction) -> bool:
+    """行上是否还有没退回的扣款金额（AUTH_FAILED 会把状态先改掉，所以不看状态）。"""
+    return transaction.balance_applied and (transaction.applied_amount or Decimal("0")) > 0
+
+
+def _charge_chain(session: Session, transaction: CardTransaction) -> list[CardTransaction]:
+    """收集同一笔扣款的全部流水行。
+
+    平台在 SETTLED 阶段会换新的 transactionId 并带 relatedTransactionId，
+    所以既要顺着 related 往上找原单，也要反向找指回本单的行（SETTLED 先到时原单还没落库）。
+    只沿扣款状态走，避免把退款/修正行混进来。
+    """
+    chain = [transaction]
+    visited = {transaction.transaction_id}
+    frontier = [transaction]
+    for _ in range(MAX_CHAIN_DEPTH):
+        next_frontier: list[CardTransaction] = []
+        for row in frontier:
+            parent_id = row.related_transaction_id
+            if parent_id and parent_id not in visited:
+                visited.add(parent_id)
+                parent = crud.get_card_transaction(session, parent_id, for_update=True)
+                if parent is not None:
+                    chain.append(parent)
+                    next_frontier.append(parent)
+            for child in crud.list_related_charges(
+                session,
+                related_transaction_id=row.transaction_id,
+                statuses=sorted(CHARGE_STATUSES),
+            ):
+                if child.transaction_id in visited:
+                    continue
+                visited.add(child.transaction_id)
+                chain.append(child)
+                next_frontier.append(child)
+        if not next_frontier:
+            break
+        frontier = next_frontier
+    return chain
+
+
+def _charged_in_chain(chain: list[CardTransaction]) -> CardTransaction | None:
+    """链上真正持有扣款的那一行（退款/修正行本身也记金额，要排除）。"""
+    for row in chain:
+        if not _holds_charge(row):
+            continue
+        status = (row.event_status or "").upper()
+        if status in REFUND_STATUSES or status == "CORRECTION":
+            continue
+        return row
+    return None
+
+
+def _credit_pending_refunds(
+    session: Session,
+    chain: list[CardTransaction],
+    charged: CardTransaction,
+    card: Card,
+) -> None:
+    """退款可能先于扣款到达，扣款成功后按整条链把挂起的退款补记上。"""
+    for refund in crud.list_pending_refunds(
+        session,
+        related_transaction_ids=[row.transaction_id for row in chain],
+        statuses=sorted(REFUND_STATUSES),
+    ):
+        _credit_refund(refund, charged, card)
 
 
 def _apply_charge(session: Session, transaction: CardTransaction, card: Card) -> None:
@@ -322,6 +395,26 @@ def _apply_charge(session: Session, transaction: CardTransaction, card: Card) ->
     amount = transaction.actual_amount or Decimal("0")
     if amount <= 0:
         # 0 金额不占首次扣款名额，留给后面的 AUTH_SUCCESS / SETTLED
+        return
+
+    # SETTLED 会换新 transactionId 指回原单：整条链只扣一次
+    chain = _charge_chain(session, transaction)
+    charged = _charged_in_chain(chain)
+    if charged is not None:
+        transaction.balance_applied = True
+        transaction.applied_amount = Decimal("0")
+        transaction.use_counted = charged.use_counted
+        logger.info(
+            "卡交易已由关联流水扣款，跳过本次扣减 card=%s transaction=%s status=%s "
+            "已扣流水=%s 金额=%s 余额=%s",
+            card.card_id,
+            transaction.transaction_id,
+            transaction.event_status,
+            charged.transaction_id,
+            charged.applied_amount,
+            card.balance,
+        )
+        _credit_pending_refunds(session, chain, charged, card)
         return
 
     before_balance = card.balance
@@ -354,30 +447,39 @@ def _apply_charge(session: Session, transaction: CardTransaction, card: Card) ->
     )
 
     # 退款/撤销可能先于原扣款到达，扣款成功后把挂起的退款补上
-    for refund in crud.list_pending_refunds(
-        session,
-        related_transaction_id=transaction.transaction_id,
-        statuses=sorted(REFUND_STATUSES),
-    ):
-        _credit_refund(refund, transaction, card)
+    _credit_pending_refunds(session, chain, transaction, card)
 
 
-def _revert_charge(transaction: CardTransaction, card: Card) -> None:
-    if not transaction.balance_applied:
+def _revert_charge(session: Session, transaction: CardTransaction, card: Card) -> None:
+    if _holds_charge(transaction):
+        charged = transaction
+    else:
+        # AUTH_FAILED 可能打在 SETTLED 的关联行上，钱其实扣在链上另一条流水
+        charged = _charged_in_chain(_charge_chain(session, transaction))
+    if charged is None:
+        transaction.balance_applied = False
+        transaction.use_counted = False
+        transaction.applied_amount = Decimal("0")
         return
-    amount = transaction.applied_amount or Decimal("0")
+
+    amount = charged.applied_amount or Decimal("0")
     before_balance = card.balance
     before_count = card.used_count
     card.balance = before_balance + amount
-    if transaction.use_counted:
+    if charged.use_counted:
         card.used_count = max(0, before_count - 1)
-    transaction.balance_applied = False
-    transaction.use_counted = False
-    transaction.applied_amount = Decimal("0")
+    charged.balance_applied = False
+    charged.use_counted = False
+    charged.applied_amount = Decimal("0")
+    if charged is not transaction:
+        # 关联行只是一笔扣款的另一条流水，退回后一起清标记
+        transaction.balance_applied = False
+        transaction.use_counted = False
+        transaction.applied_amount = Decimal("0")
     logger.info(
         "卡交易失败退回 card=%s transaction=%s 金额=%s 余额=%s -> %s 次数=%d -> %d",
         card.card_id,
-        transaction.transaction_id,
+        charged.transaction_id,
         amount,
         before_balance,
         card.balance,
@@ -404,14 +506,23 @@ def _apply_refund(session: Session, transaction: CardTransaction, card: Card) ->
         transaction.related_transaction_id,
         for_update=True,
     )
-    if original is None or not original.balance_applied:
+    if original is None:
         logger.warning(
             "退款/撤销找不到已扣款的原交易，暂不记账 transaction=%s related=%s",
             transaction.transaction_id,
             transaction.related_transaction_id,
         )
         return
-    _credit_refund(transaction, original, card)
+    # 原单可能是 SETTLED 的关联行，真正扣款的钱在链上另一条流水
+    charged = _charged_in_chain(_charge_chain(session, original))
+    if charged is None:
+        logger.warning(
+            "退款/撤销找不到已扣款的原交易，暂不记账 transaction=%s related=%s",
+            transaction.transaction_id,
+            transaction.related_transaction_id,
+        )
+        return
+    _credit_refund(transaction, charged, card)
 
 
 def _credit_refund(transaction: CardTransaction, original: CardTransaction, card: Card) -> None:

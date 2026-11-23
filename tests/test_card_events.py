@@ -479,6 +479,322 @@ async def test_settled_then_processing_does_not_regress_status(db_session, make_
     assert transaction.event_status == "SETTLED"
 
 
+async def test_settled_with_new_id_related_to_charge_does_not_deduct(db_session, make_body):
+    """SETTLED 换新 transactionId 且 related 指回已扣款的原单时，只推进状态、不再扣钱。"""
+    card = make_card(db_session, balance=Decimal("48.00"))
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_auth",
+            status="AUTH_SUCCESS",
+            actual="15.63",
+            event_id="evt_auth",
+        ),
+    )
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_settled",
+            status="SETTLED",
+            actual="15.63",
+            related="txn_auth",
+            event_id="evt_settled",
+        ),
+    )
+
+    db_session.refresh(card)
+    assert card.used_count == 1
+    assert card.balance == Decimal("48.00") - Decimal("15.63")
+    settled = crud.get_card_transaction(db_session, "txn_settled")
+    assert settled is not None
+    assert settled.event_status == "SETTLED"
+    assert settled.balance_applied is True
+    assert settled.applied_amount == Decimal("0.00")
+    assert settled.use_counted is True
+
+
+async def test_settled_related_to_processing_does_not_deduct(db_session, make_body):
+    """PROCESSING 直接到 SETTLED、SETTLED 换新 ID 指回 PROCESSING 时，也只扣一次。"""
+    card = make_card(db_session, balance=Decimal("48.00"))
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_processing",
+            status="PROCESSING",
+            actual="15.63",
+            event_id="evt_processing",
+        ),
+    )
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_settled",
+            status="SETTLED",
+            actual="15.63",
+            related="txn_processing",
+            event_id="evt_settled",
+        ),
+    )
+
+    db_session.refresh(card)
+    assert card.used_count == 1
+    assert card.balance == Decimal("48.00") - Decimal("15.63")
+    settled = crud.get_card_transaction(db_session, "txn_settled")
+    assert settled is not None
+    assert settled.event_status == "SETTLED"
+    assert settled.balance_applied is True
+    assert settled.applied_amount == Decimal("0.00")
+
+
+async def test_auth_failed_on_settled_related_to_processing_returns_balance(db_session, make_body):
+    """AUTH_FAILED 打在关联 PROCESSING 的 SETTLED 行上，退回 PROCESSING 扣的钱。"""
+    card = make_card(db_session, balance=Decimal("48.00"))
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_processing",
+            status="PROCESSING",
+            actual="15.63",
+            event_id="evt_processing",
+        ),
+    )
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_settled",
+            status="SETTLED",
+            actual="15.63",
+            related="txn_processing",
+            event_id="evt_settled",
+        ),
+    )
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_settled",
+            status="AUTH_FAILED",
+            actual="0.00",
+            related="txn_processing",
+            event_id="evt_failed",
+        ),
+    )
+
+    db_session.refresh(card)
+    assert card.used_count == 0
+    assert card.balance == Decimal("48.00")
+    processing = crud.get_card_transaction(db_session, "txn_processing")
+    assert processing is not None
+    assert processing.balance_applied is False
+    assert processing.applied_amount == Decimal("0.00")
+
+
+async def test_settled_before_original_transaction_does_not_double(db_session, make_body):
+    """SETTLED 先到、原单后到：反向关联也认，整笔只扣一次。"""
+    card = make_card(db_session, balance=Decimal("48.00"))
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_settled",
+            status="SETTLED",
+            actual="15.63",
+            related="txn_auth",
+            event_id="evt_settled",
+        ),
+    )
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_auth",
+            status="AUTH_SUCCESS",
+            actual="15.63",
+            event_id="evt_auth",
+        ),
+    )
+
+    db_session.refresh(card)
+    assert card.used_count == 1
+    assert card.balance == Decimal("48.00") - Decimal("15.63")
+    auth = crud.get_card_transaction(db_session, "txn_auth")
+    assert auth is not None
+    assert auth.balance_applied is True
+    assert auth.applied_amount == Decimal("0.00")
+
+
+async def test_auth_failed_on_related_transaction_returns_balance(db_session, make_body):
+    """AUTH_FAILED 打在关联行上，也要退回钱和次数，不能只看本行 applied_amount。"""
+    card = make_card(db_session, balance=Decimal("48.00"))
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_auth",
+            status="AUTH_SUCCESS",
+            actual="15.63",
+            event_id="evt_auth",
+        ),
+    )
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_settled",
+            status="SETTLED",
+            actual="15.63",
+            related="txn_auth",
+            event_id="evt_settled",
+        ),
+    )
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_settled",
+            status="AUTH_FAILED",
+            actual="0.00",
+            related="txn_auth",
+            event_id="evt_failed",
+        ),
+    )
+
+    db_session.refresh(card)
+    assert card.used_count == 0
+    assert card.balance == Decimal("48.00")
+    auth = crud.get_card_transaction(db_session, "txn_auth")
+    assert auth is not None
+    assert auth.balance_applied is False
+    assert auth.applied_amount == Decimal("0.00")
+
+
+async def test_refund_against_settled_related_transaction_credits(db_session, make_body):
+    """退款关联到 SETTLED 的关联行时，仍要按链上扣款行退钱并减次数。"""
+    card = make_card(db_session, balance=Decimal("48.00"))
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_auth",
+            status="AUTH_SUCCESS",
+            actual="15.63",
+            event_id="evt_auth",
+        ),
+    )
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_settled",
+            status="SETTLED",
+            actual="15.63",
+            related="txn_auth",
+            event_id="evt_settled",
+        ),
+    )
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_refund",
+            status="REFUND_SUCCESS",
+            actual="5.00",
+            related="txn_settled",
+            event_id="evt_refund",
+        ),
+    )
+
+    db_session.refresh(card)
+    assert card.used_count == 0
+    assert card.balance == Decimal("48.00") - Decimal("15.63") + Decimal("5.00")
+    refund = crud.get_card_transaction(db_session, "txn_refund")
+    assert refund is not None
+    assert refund.balance_applied is True
+
+
+async def test_refund_waiting_for_original_applies_when_charge_lands(db_session, make_body):
+    """退款先挂起并指向原单，扣款落在 SETTLED 新行上时，原单到达后补记退款。"""
+    card = make_card(db_session, balance=Decimal("48.00"))
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_refund",
+            status="REFUND_SUCCESS",
+            actual="5.00",
+            related="txn_auth",
+            event_id="evt_refund",
+        ),
+    )
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_settled",
+            status="SETTLED",
+            actual="15.63",
+            related="txn_auth",
+            event_id="evt_settled",
+        ),
+    )
+    db_session.refresh(card)
+    assert card.balance == Decimal("48.00") - Decimal("15.63")
+
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_auth",
+            status="AUTH_SUCCESS",
+            actual="15.63",
+            event_id="evt_auth",
+        ),
+    )
+
+    db_session.refresh(card)
+    assert card.used_count == 0
+    assert card.balance == Decimal("48.00") - Decimal("15.63") + Decimal("5.00")
+    refund = crud.get_card_transaction(db_session, "txn_refund")
+    assert refund is not None
+    assert refund.balance_applied is True
+
+
+async def test_correction_with_related_transaction_still_deducts(db_session, make_body):
+    """CORRECTION 带 related 是补扣差额，不能被链上去重跳过。"""
+    card = make_card(db_session, balance=Decimal("48.00"))
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_auth",
+            status="AUTH_SUCCESS",
+            actual="15.63",
+            event_id="evt_auth",
+        ),
+    )
+    handle_card_transaction(
+        db_session,
+        transaction_event(
+            make_body,
+            transaction_id="txn_correction",
+            status="CORRECTION",
+            actual="2.00",
+            related="txn_auth",
+            event_id="evt_correction",
+        ),
+    )
+
+    db_session.refresh(card)
+    assert card.used_count == 1
+    assert card.balance == Decimal("48.00") - Decimal("15.63") - Decimal("2.00")
+
+
 async def test_zero_amount_processing_waits_for_auth_success(db_session, make_body):
     card = make_card(db_session, balance=Decimal("48.00"))
     handle_card_transaction(

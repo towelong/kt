@@ -128,7 +128,7 @@ class SettledToLedger(EventHandler[CardTransactionEvent]):
 - 缺卡时先查账户余额：USD 够直接开；不够按 `CARD_STOCK_USDT_USD_RATE`（默认 0.997）把缺口折成 USDT 兑换，兑换后重新查余额；两边都不够打 `error` 日志并跳过本轮。USD 需求 = 首充 + 每张 0.10 的开卡费（plus 备 48.10），开卡费固定写在 `PlanSpec.opening_fee`，不放进 `rechargeAmount`。
 - 卡 BIN 只选 `issuingCountry=US` 且 BIN 以 `5378` 开头的配置；配额用尽或没有匹配 BIN 时打 error。
 - 开卡前先写 `card` 占位行（`request_no` 唯一，含套餐名），余额为 0，超时后下一轮不会重复提交；三要素等开卡 Webhook 补齐、首充 `CARD_OPERATION.RECHARGE_SUCCESS` 到账后才 `enabled`。
-- 交易 Webhook 按 `transaction_id` 落 `card_transaction`：`PROCESSING` / `AUTH_SUCCESS` / `SETTLED` 三个扣款状态谁先到谁扣一次（`actual_amount > 0` 时 `balance -= actual_amount`、次数 +1），后到的只推进状态；`AUTH_FAILED` 已扣过才按 `applied_amount` 退回并次数 -1；退款/撤销（独立交易）在原交易已扣时 -1 并加回，先到会挂起等原扣款成功再补；`CORRECTION` 按负数继续扣、不计次数。状态只单向推进，同交易多阶段乱序/重投都不重复，卡行加锁串行。
+- 交易 Webhook 按 `transaction_id` 落 `card_transaction`：`PROCESSING` / `AUTH_SUCCESS` / `SETTLED` 三个扣款状态谁先到谁扣一次（`actual_amount > 0` 时 `balance -= actual_amount`、次数 +1），后到的只推进状态；`SETTLED` 常换新 `transaction_id` 并用 `related_transaction_id` 指回原单，去重按整条关联链算，链上已有扣款行就不再动余额和次数；`AUTH_FAILED` 已扣过才按实际扣款行的 `applied_amount` 退回并次数 -1；退款/撤销（独立交易）在原交易已扣时 -1 并加回，先到会挂起等原扣款成功再补；`CORRECTION` 按负数继续扣、不计次数。状态只单向推进，同交易多阶段乱序/重投都不重复，卡行加锁串行。
 - 次数到 3 自动停用，退款把次数降回来会重新启用。
 - 卡操作事件落 `card_operation`：充值加余额、转出减余额，`eventId` 唯一约束保证重投不重复加钱；首充成功入账后启用，失败则停用。
 - 多副本部署靠 arq cron 的 `unique=True`，同一个时间点只有一个实例真正扫描。

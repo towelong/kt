@@ -170,16 +170,38 @@ def create_card_transaction(session: Session, transaction: CardTransaction) -> C
 def list_pending_refunds(
     session: Session,
     *,
+    related_transaction_ids: Sequence[str],
+    statuses: Sequence[str],
+) -> list[CardTransaction]:
+    """退款先于原扣款到达时先挂起，等原交易扣款成功后按它补记。
+
+    同一笔扣款可能被平台拆成多条流水（SETTLED 换新 ID 后用 related 指回原单），
+    所以按整条链的 ID 一起找。
+    """
+    stmt = (
+        select(CardTransaction)
+        .where(
+            CardTransaction.related_transaction_id.in_(related_transaction_ids),
+            CardTransaction.event_status.in_(statuses),
+            CardTransaction.balance_applied.is_(False),
+        )
+        .with_for_update()
+    )
+    return list(session.exec(stmt).all())
+
+
+def list_related_charges(
+    session: Session,
+    *,
     related_transaction_id: str,
     statuses: Sequence[str],
 ) -> list[CardTransaction]:
-    """退款先于原扣款到达时先挂起，等原交易扣款成功后按它补记。"""
+    """按关联原交易找同一笔扣款的其它流水行，用于跨 transaction_id 去重。"""
     stmt = (
         select(CardTransaction)
         .where(
             CardTransaction.related_transaction_id == related_transaction_id,
             CardTransaction.event_status.in_(statuses),
-            CardTransaction.balance_applied.is_(False),
         )
         .with_for_update()
     )
